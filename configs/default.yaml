@@ -17,8 +17,8 @@ model:
 
 data:
   dataset: "openai/gsm8k"
-  max_seq_len: 512
-  batch_size: 4
+  max_seq_len: 128
+  batch_size: 1
   num_workers: 2
 
 training:
@@ -26,11 +26,12 @@ training:
   weight_decay: 0.01
   warmup_steps: 100
   max_steps: 1000
-  grad_accum_steps: 1
+  grad_accum_steps: 4
+  gradient_checkpointing: true
   max_grad_norm: 1.0
-  dtype: "bfloat16"        # 训练精度
+  dtype: "float16"         # V100 不支持 bf16，用 fp16
   log_interval: 10
-  eval_interval: 200
+  eval_interval: 99999    # TP 时 eval 会 hang（只有 rank 0 做 eval 但模型内 broadcast 需要所有 rank）
   save_interval: 500
   output_dir: "checkpoints"
 

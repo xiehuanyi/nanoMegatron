@@ -71,12 +71,19 @@ class ZeROOptimizer:
         elif self.stage == 3:
             self._step_stage3()
 
+    def _ensure_grads(self):
+        """确保所有参数都有梯度张量（即使是零），否则 collective 会 rank 不同步导致死锁。"""
+        for p in self.all_params:
+            if p.grad is None:
+                p.grad = torch.zeros_like(p.data)
+
     def _step_stage1(self):
         """ZeRO-1: AllReduce 梯度 → 本地更新 → Broadcast 参数。"""
+        self._ensure_grads()
+
         # 1) AllReduce 所有梯度（和 DDP 一样，所有 rank 得到相同的平均梯度）
         for p in self.all_params:
-            if p.grad is not None:
-                dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
+            dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
 
         # 2) 只更新本地负责的参数
         self.optimizer.step()
@@ -92,11 +99,12 @@ class ZeROOptimizer:
         和 Stage 1 的区别：不用 AllReduce，用 Reduce 把梯度只发给负责的 rank。
         这样非 owner rank 不需要存这个参数的梯度。
         """
+        self._ensure_grads()
+
         # 1) Reduce 梯度到各参数的 owner rank
         for i, p in enumerate(self.all_params):
-            if p.grad is not None:
-                owner = i % self.world_size
-                dist.reduce(p.grad, dst=owner, op=dist.ReduceOp.AVG)
+            owner = i % self.world_size
+            dist.reduce(p.grad, dst=owner, op=dist.ReduceOp.AVG)
 
         # 2) 只更新本地负责的参数
         self.optimizer.step()
@@ -115,11 +123,12 @@ class ZeROOptimizer:
         """ZeRO-3: 梯度 Reduce → 更新本地分片。
         参数的 AllGather/释放在 forward hook 中处理。
         """
+        self._ensure_grads()
+
         # 1) Reduce 梯度到 owner
         for i, p in enumerate(self.all_params):
-            if p.grad is not None:
-                owner = i % self.world_size
-                dist.reduce(p.grad, dst=owner, op=dist.ReduceOp.AVG)
+            owner = i % self.world_size
+            dist.reduce(p.grad, dst=owner, op=dist.ReduceOp.AVG)
 
         # 2) 更新本地参数分片
         self.optimizer.step()

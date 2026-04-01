@@ -31,9 +31,11 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # RMS = sqrt(mean(x^2) + eps)
+        # 始终在 fp32 下计算（fp16 下 x^2 容易溢出）
+        orig_dtype = x.dtype
+        x = x.float()
         rms = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-        return self.weight * (x * rms) + self.bias
+        return (self.weight.float() * (x * rms) + self.bias.float()).to(orig_dtype)
 
 
 def build_rope_cache(seq_len: int, head_dim: int, theta: float = 10000.0,
@@ -142,9 +144,16 @@ class PhiMoESparseMoE(nn.Module):
 
         # 路由：计算每个 token 对所有 expert 的分数
         router_logits = self.gate(x_flat)                          # [B*L, num_experts]
-        # Top-K 选择
-        topk_weights, topk_indices = torch.topk(router_logits, self.num_experts_per_tok, dim=-1)
-        topk_weights = F.softmax(topk_weights, dim=-1)             # 归一化权重
+        # Top-K 选择（在 fp32 下做 softmax，防止溢出）
+        topk_weights, topk_indices = torch.topk(router_logits.float(), self.num_experts_per_tok, dim=-1)
+        topk_weights = F.softmax(topk_weights, dim=-1).to(x.dtype)  # 归一化权重
+
+        # TP 场景下，AllReduce 的浮点非结合性会导致各 rank 的 routing 微小不同。
+        # 从 rank 0 广播 routing 决策，确保所有 rank 的 expert 分配完全一致。
+        import torch.distributed as dist
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            dist.broadcast(topk_indices, src=0)
+            dist.broadcast(topk_weights, src=0)
 
         # 对每个 token，过选中的 expert 并加权求和
         # 注意：这里用简单循环实现，清晰易懂。生产环境会用 scatter/gather 加速。
@@ -207,6 +216,11 @@ class PhiMoEModel(nn.Module):
         self.layers = nn.ModuleList([PhiMoEDecoderLayer(config) for _ in range(config.num_layers)])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.config = config
+        self.gradient_checkpointing = False
+
+    def enable_gradient_checkpointing(self):
+        """开启梯度检查点：用时间换显存，forward 时不保存中间激活，backward 时重算。"""
+        self.gradient_checkpointing = True
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         B, L = input_ids.shape
@@ -220,7 +234,13 @@ class PhiMoEModel(nn.Module):
 
         all_router_logits = []
         for layer in self.layers:
-            x, router_logits = layer(x, cos, sin)
+            if self.gradient_checkpointing and self.training:
+                # 梯度检查点：不保存中间激活，backward 时重新计算
+                x, router_logits = torch.utils.checkpoint.checkpoint(
+                    layer, x, cos, sin, use_reentrant=False
+                )
+            else:
+                x, router_logits = layer(x, cos, sin)
             all_router_logits.append(router_logits)
 
         x = self.norm(x)
@@ -243,7 +263,8 @@ class PhiMoEForCausalLM(nn.Module):
         loss = None
         if labels is not None:
             # 标准 next-token prediction loss
-            shift_logits = logits[..., :-1, :].contiguous()
+            # 始终在 fp32 下计算 loss，防止 fp16 溢出导致 NaN
+            shift_logits = logits[..., :-1, :].contiguous().float()
             shift_labels = labels[..., 1:].contiguous()
             loss = F.cross_entropy(
                 shift_logits.view(-1, shift_logits.size(-1)),

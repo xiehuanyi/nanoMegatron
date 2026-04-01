@@ -68,6 +68,12 @@ def main():
     model = PhiMoEForCausalLM(config.model)
     load_hf_weights(model, config.model.name)
 
+    # ── 梯度检查点（省显存）──
+    if getattr(config.training, "gradient_checkpointing", False):
+        model.model.enable_gradient_checkpointing()
+        if is_main_process():
+            print("[CONFIG] Gradient checkpointing enabled")
+
     # ── 应用并行策略 ──
     strategy = config.parallel.strategy
     custom_optimizer = None
@@ -108,7 +114,9 @@ def main():
         progress = (step - warmup) / max(1, max_steps - warmup)
         return 0.5 * (1 + math.cos(math.pi * progress))
 
-    scheduler = LambdaLR(optimizer, lr_lambda)
+    # ZeROOptimizer 不是 torch.optim.Optimizer 子类，需要对内部 optimizer 挂 scheduler
+    inner_opt = getattr(optimizer, "optimizer", optimizer)
+    scheduler = LambdaLR(inner_opt, lr_lambda)
 
     # ── 创建数据加载器 ──
     train_loader = create_dataloader(tokenizer, config, split="train")

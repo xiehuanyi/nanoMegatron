@@ -7,47 +7,25 @@
 #SBATCH --mem=128G
 #SBATCH --time=24:00:00
 
-# ============================================================
-# nanoMegatron SFT 实验：在 4×V100 上跑各种并行策略
-# ============================================================
-
-set -e
-
+set +e
 cd /ibex/project/c2334/huanyi/nanoMegatron
 
-# 公共参数
+source /ibex/user/xieh0a/miniconda3/etc/profile.d/conda.sh
+conda activate /ibex/project/c2334/huanyi/conda_env/finetuning
+pip install -q datasets safetensors pyyaml 2>/dev/null
+
+export PYTHONPATH="/ibex/project/c2334/huanyi/nanoMegatron:$PYTHONPATH"
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export NCCL_TIMEOUT=300
+
 CONFIG="configs/default.yaml"
 NPROC=4
 
 echo "=========================================="
-echo "Experiment 1/6: DDP"
-echo "=========================================="
-torchrun --nproc_per_node=$NPROC scripts/train.py --config $CONFIG --strategy ddp 2>&1 | tee logs/ddp.log
-
-echo "=========================================="
-echo "Experiment 2/6: ZeRO-1"
-echo "=========================================="
-torchrun --nproc_per_node=$NPROC scripts/train.py --config $CONFIG --strategy zero1 2>&1 | tee logs/zero1.log
-
-echo "=========================================="
-echo "Experiment 3/6: ZeRO-2"
-echo "=========================================="
-torchrun --nproc_per_node=$NPROC scripts/train.py --config $CONFIG --strategy zero2 2>&1 | tee logs/zero2.log
-
-echo "=========================================="
-echo "Experiment 4/6: ZeRO-3"
-echo "=========================================="
-torchrun --nproc_per_node=$NPROC scripts/train.py --config $CONFIG --strategy zero3 2>&1 | tee logs/zero3.log
-
-echo "=========================================="
-echo "Experiment 5/6: Tensor Parallel (tp=4)"
+echo "Tensor Parallel (tp=4, fp32, ~20GB/GPU)"
 echo "=========================================="
 torchrun --nproc_per_node=$NPROC scripts/train.py --config $CONFIG --strategy tp --tp_size 4 2>&1 | tee logs/tp.log
-
-echo "=========================================="
-echo "Experiment 6/6: Expert Parallel (ep=4)"
-echo "=========================================="
-torchrun --nproc_per_node=$NPROC scripts/train.py --config $CONFIG --strategy ep --ep_size 4 2>&1 | tee logs/ep.log
+echo "TP EXIT CODE: $?"
 
 echo "=========================================="
 echo "All experiments finished!"

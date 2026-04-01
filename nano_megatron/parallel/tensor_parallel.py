@@ -72,7 +72,7 @@ class ColumnParallelLinear(nn.Module):
     典型用法：Attention 的 Q/K/V 投影（按 head 切），MoE 的 w1/w3。
     """
 
-    def __init__(self, in_features, out_features, bias=True, tp_group=None):
+    def __init__(self, in_features, out_features, bias=True, tp_group=None, device=None):
         super().__init__()
         self.tp_group = tp_group
         tp_size = dist.get_world_size(tp_group)
@@ -81,7 +81,7 @@ class ColumnParallelLinear(nn.Module):
         assert out_features % tp_size == 0, f"out_features({out_features}) 必须能被 tp_size({tp_size}) 整除"
         self.out_per_rank = out_features // tp_size
 
-        self.linear = nn.Linear(in_features, self.out_per_rank, bias=bias)
+        self.linear = nn.Linear(in_features, self.out_per_rank, bias=bias, device=device)
 
     def forward(self, x):
         # 输入不需要切：所有 GPU 拿到相同的 x（反向时 AllReduce 梯度）
@@ -108,7 +108,7 @@ class RowParallelLinear(nn.Module):
     典型用法：Attention 的 O 投影，MoE 的 w2。
     """
 
-    def __init__(self, in_features, out_features, bias=True, tp_group=None):
+    def __init__(self, in_features, out_features, bias=True, tp_group=None, device=None):
         super().__init__()
         self.tp_group = tp_group
         tp_size = dist.get_world_size(tp_group)
@@ -116,7 +116,7 @@ class RowParallelLinear(nn.Module):
         assert in_features % tp_size == 0
         self.in_per_rank = in_features // tp_size
 
-        self.linear = nn.Linear(self.in_per_rank, out_features, bias=bias)
+        self.linear = nn.Linear(self.in_per_rank, out_features, bias=bias, device=device)
 
     def forward(self, x):
         # x 已经是切分过的（来自上游 ColumnParallel 的输出）
@@ -144,7 +144,8 @@ def tp_parallelize_attention(attn, tp_group):
     Q, K, V → ColumnParallel（按 head 数切分输出维度）
     O       → RowParallel（把各 GPU 的部分结果聚合）
     """
-    # 保存原始权重
+    # 保存原始权重（在原来的 device 上）
+    device = attn.q_proj.weight.device
     q_w, q_b = attn.q_proj.weight.data, attn.q_proj.bias.data
     k_w, k_b = attn.k_proj.weight.data, attn.k_proj.bias.data
     v_w, v_b = attn.v_proj.weight.data, attn.v_proj.bias.data
@@ -156,11 +157,11 @@ def tp_parallelize_attention(attn, tp_group):
     v_out = v_w.shape[0]
     o_out = o_w.shape[0]
 
-    # 替换为并行版本
-    attn.q_proj = ColumnParallelLinear(in_dim, q_out, bias=True, tp_group=tp_group)
-    attn.k_proj = ColumnParallelLinear(in_dim, k_out, bias=True, tp_group=tp_group)
-    attn.v_proj = ColumnParallelLinear(in_dim, v_out, bias=True, tp_group=tp_group)
-    attn.o_proj = RowParallelLinear(q_out, o_out, bias=True, tp_group=tp_group)
+    # 替换为并行版本（在同一 device 上创建）
+    attn.q_proj = ColumnParallelLinear(in_dim, q_out, bias=True, tp_group=tp_group, device=device)
+    attn.k_proj = ColumnParallelLinear(in_dim, k_out, bias=True, tp_group=tp_group, device=device)
+    attn.v_proj = ColumnParallelLinear(in_dim, v_out, bias=True, tp_group=tp_group, device=device)
+    attn.o_proj = RowParallelLinear(q_out, o_out, bias=True, tp_group=tp_group, device=device)
 
     # 加载对应分片的权重
     attn.q_proj.load_weight_shard(q_w, q_b)
@@ -172,6 +173,7 @@ def tp_parallelize_attention(attn, tp_group):
     tp_size = dist.get_world_size(tp_group)
     attn.num_heads = attn.num_heads // tp_size
     attn.num_kv_heads = attn.num_kv_heads // tp_size
+    attn.num_kv_groups = attn.num_heads // attn.num_kv_heads
 
 
 def tp_parallelize_expert(expert, tp_group):
@@ -180,6 +182,7 @@ def tp_parallelize_expert(expert, tp_group):
     w1, w3 → ColumnParallel（沿 intermediate_size 切）
     w2     → RowParallel（结果 AllReduce）
     """
+    device = expert.w1.weight.device
     w1_w = expert.w1.weight.data
     w2_w = expert.w2.weight.data
     w3_w = expert.w3.weight.data
@@ -188,9 +191,9 @@ def tp_parallelize_expert(expert, tp_group):
     mid_dim = w1_w.shape[0]    # intermediate_size
     out_dim = w2_w.shape[0]    # hidden_size
 
-    expert.w1 = ColumnParallelLinear(in_dim, mid_dim, bias=False, tp_group=tp_group)
-    expert.w3 = ColumnParallelLinear(in_dim, mid_dim, bias=False, tp_group=tp_group)
-    expert.w2 = RowParallelLinear(mid_dim, out_dim, bias=False, tp_group=tp_group)
+    expert.w1 = ColumnParallelLinear(in_dim, mid_dim, bias=False, tp_group=tp_group, device=device)
+    expert.w3 = ColumnParallelLinear(in_dim, mid_dim, bias=False, tp_group=tp_group, device=device)
+    expert.w2 = RowParallelLinear(mid_dim, out_dim, bias=False, tp_group=tp_group, device=device)
 
     expert.w1.load_weight_shard(w1_w)
     expert.w3.load_weight_shard(w3_w)
@@ -217,8 +220,10 @@ def setup_tp(model, config):
 
     model = model.to(rank)
 
-    # 替换每一层的 Attention 和 Expert
-    base = getattr(model, "module", model)  # 兼容 DDP 包装
+    # 对 Attention 和 Expert FFN 做 TP
+    # 注意：TP 要求所有 rank 输入相同数据（不用 DistributedSampler），
+    # 这样 MoE 路由结果一致，每个 expert 处理的 token 数也一致，AllReduce 大小匹配
+    base = getattr(model, "module", model)
     for layer in base.model.layers:
         tp_parallelize_attention(layer.self_attn, tp_group)
         for expert in layer.block_sparse_moe.experts:

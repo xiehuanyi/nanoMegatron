@@ -43,7 +43,12 @@ class Trainer:
         # 混合精度
         dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
         self.dtype = dtype_map.get(config.training.dtype, torch.bfloat16)
-        self.scaler = torch.amp.GradScaler("cuda", enabled=(self.dtype == torch.float16))
+
+        # GradScaler 只在标准 optimizer + fp16 时使用
+        # ZeRO 等自定义 optimizer 不兼容 scaler，直接用 autocast 即可
+        is_standard_opt = isinstance(optimizer, torch.optim.Optimizer)
+        self.use_scaler = (self.dtype == torch.float16) and is_standard_opt
+        self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_scaler)
 
     def train(self):
         cfg = self.config.training
@@ -72,13 +77,15 @@ class Trainer:
                 total_loss += loss
             avg_loss = total_loss / cfg.grad_accum_steps
 
-            # 梯度裁剪
-            self.scaler.unscale_(self.optimizer)
-            nn.utils.clip_grad_norm_(self.model.parameters(), cfg.max_grad_norm)
-
-            # 优化器更新
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
+            # 梯度裁剪 + 优化器更新
+            if self.use_scaler:
+                self.scaler.unscale_(self.optimizer)
+                nn.utils.clip_grad_norm_(self.model.parameters(), cfg.max_grad_norm)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                nn.utils.clip_grad_norm_(self.model.parameters(), cfg.max_grad_norm)
+                self.optimizer.step()
             self.optimizer.zero_grad()
             if self.scheduler:
                 self.scheduler.step()
@@ -90,7 +97,8 @@ class Trainer:
             if global_step % cfg.log_interval == 0 and is_main_process():
                 tokens_per_sec = (batch["input_ids"].numel() * cfg.grad_accum_steps) / dt
                 self.metrics.update(loss=avg_loss, tokens_per_sec=tokens_per_sec)
-                lr = self.optimizer.param_groups[0]["lr"]
+                inner_opt = getattr(self.optimizer, "optimizer", self.optimizer)
+                lr = inner_opt.param_groups[0]["lr"]
                 print(f"  step {global_step:5d} | loss {avg_loss:.4f} | "
                       f"lr {lr:.2e} | tok/s {tokens_per_sec:.0f} | "
                       f"mem {torch.cuda.max_memory_allocated()/1e9:.1f}GB")
@@ -118,7 +126,10 @@ class Trainer:
             output = self.model(input_ids=batch["input_ids"], labels=batch["labels"])
             loss = output["loss"] / self.config.training.grad_accum_steps
 
-        self.scaler.scale(loss).backward()
+        if self.use_scaler:
+            self.scaler.scale(loss).backward()
+        else:
+            loss.backward()
         return loss.item() * self.config.training.grad_accum_steps
 
     def _save_checkpoint(self, step):
