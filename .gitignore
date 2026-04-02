@@ -7,3 +7,7 @@ checkpoints/
 *.err
 wandb/
 .cache/
+dcgm/
+logs/
+nanomega_sft_*.log
+nanomega_sft_*.err
