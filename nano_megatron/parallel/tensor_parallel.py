@@ -222,9 +222,10 @@ def setup_tp(model, config):
 
     # 对 Attention 和 Expert FFN 做 TP
     # 注意：TP 要求所有 rank 输入相同数据（不用 DistributedSampler），
-    # 这样 MoE 路由结果一致，每个 expert 处理的 token 数也一致，AllReduce 大小匹配
+    # 且需要广播路由决策（AllReduce 浮点非结合性可能导致各 rank 路由不同）
     base = getattr(model, "module", model)
     for layer in base.model.layers:
+        layer.block_sparse_moe._sync_routing = True  # 启用路由广播
         tp_parallelize_attention(layer.self_attn, tp_group)
         for expert in layer.block_sparse_moe.experts:
             tp_parallelize_expert(expert, tp_group)

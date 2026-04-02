@@ -53,6 +53,9 @@ def build_rope_cache(seq_len: int, head_dim: int, theta: float = 10000.0,
 
 def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
     """对 x 施加 RoPE 旋转。x: [batch, heads, seq_len, head_dim]。"""
+    # cos/sin 转成和 x 相同的 dtype，避免 fp16 模型时 dtype 不匹配
+    cos = cos.to(x.dtype)
+    sin = sin.to(x.dtype)
     # 把相邻维度配对旋转：(x0, x1) -> (x0*cos - x1*sin, x0*sin + x1*cos)
     d = x.shape[-1]
     x_rot = torch.stack([-x[..., d // 2:], x[..., :d // 2]], dim=-1).flatten(-2)
@@ -148,10 +151,11 @@ class PhiMoESparseMoE(nn.Module):
         topk_weights, topk_indices = torch.topk(router_logits.float(), self.num_experts_per_tok, dim=-1)
         topk_weights = F.softmax(topk_weights, dim=-1).to(x.dtype)  # 归一化权重
 
-        # TP 场景下，AllReduce 的浮点非结合性会导致各 rank 的 routing 微小不同。
-        # 从 rank 0 广播 routing 决策，确保所有 rank 的 expert 分配完全一致。
-        import torch.distributed as dist
-        if dist.is_initialized() and dist.get_world_size() > 1:
+        # TP 场景：AllReduce 的浮点非结合性可能导致各 rank routing 微小不同，需要广播同步
+        # ZeRO/DDP：各 rank 数据不同，不能广播
+        # EP：有自己的 EPSparseMoE.forward 处理
+        if getattr(self, "_sync_routing", False):
+            import torch.distributed as dist
             dist.broadcast(topk_indices, src=0)
             dist.broadcast(topk_weights, src=0)
 

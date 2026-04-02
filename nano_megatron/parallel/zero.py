@@ -39,12 +39,16 @@ class ZeROOptimizer:
         self.all_params = list(model.parameters())
 
         # 按 round-robin 分配参数给各 rank
-        # 例如 4 卡 8 个参数：rank0 管 [0,4], rank1 管 [1,5], rank2 管 [2,6], rank3 管 [3,7]
         self.local_params = [p for i, p in enumerate(self.all_params) if i % self.world_size == self.rank]
         self.param_to_rank = {id(p): i % self.world_size for i, p in enumerate(self.all_params)}
 
-        # 只为本地参数创建 optimizer（节省 optimizer state 内存）
-        self.optimizer = torch.optim.AdamW(self.local_params, lr=lr, weight_decay=weight_decay)
+        # 混合精度：模型可能是 fp16，但 optimizer 必须用 fp32（防止 grad² 溢出）
+        # 为本地参数创建 fp32 副本，Adam 在 fp32 上更新，再同步回 fp16 参数
+        self.fp32_copies = [p.data.float().clone() for p in self.local_params]
+        for fp32_p in self.fp32_copies:
+            fp32_p.requires_grad_(True)
+
+        self.optimizer = torch.optim.AdamW(self.fp32_copies, lr=lr, weight_decay=weight_decay)
 
         # ZeRO-3：保存参数分片，注册 forward/backward hook
         if stage == 3:
@@ -77,18 +81,33 @@ class ZeROOptimizer:
             if p.grad is None:
                 p.grad = torch.zeros_like(p.data)
 
+    def _copy_grads_to_fp32(self):
+        """把 fp16 模型梯度拷贝到 fp32 副本，供 Adam 使用。"""
+        for fp32_p, p in zip(self.fp32_copies, self.local_params):
+            if p.grad is not None:
+                fp32_p.grad = p.grad.float()
+            else:
+                fp32_p.grad = torch.zeros_like(fp32_p)
+
+    def _copy_fp32_to_model(self):
+        """把 fp32 更新后的参数同步回 fp16 模型参数。"""
+        for fp32_p, p in zip(self.fp32_copies, self.local_params):
+            p.data.copy_(fp32_p.data)
+
     def _step_stage1(self):
         """ZeRO-1: AllReduce 梯度 → 本地更新 → Broadcast 参数。"""
         self._ensure_grads()
 
-        # 1) AllReduce 所有梯度（和 DDP 一样，所有 rank 得到相同的平均梯度）
+        # 1) AllReduce 所有梯度
         for p in self.all_params:
             dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
 
-        # 2) 只更新本地负责的参数
+        # 2) 把 fp16 梯度拷贝到 fp32 副本 → Adam 在 fp32 上更新 → 同步回 fp16
+        self._copy_grads_to_fp32()
         self.optimizer.step()
+        self._copy_fp32_to_model()
 
-        # 3) Broadcast 更新后的参数（各 rank 把自己更新的参数广播给其他人）
+        # 3) Broadcast 更新后的参数
         for i, p in enumerate(self.all_params):
             owner = i % self.world_size
             dist.broadcast(p.data, src=owner)
@@ -98,6 +117,8 @@ class ZeROOptimizer:
 
         和 Stage 1 的区别：不用 AllReduce，用 Reduce 把梯度只发给负责的 rank。
         这样非 owner rank 不需要存这个参数的梯度。
+
+        显存优化：reduce 后立即释放非本地梯度，再做 fp32 优化器更新。
         """
         self._ensure_grads()
 
@@ -106,18 +127,22 @@ class ZeROOptimizer:
             owner = i % self.world_size
             dist.reduce(p.grad, dst=owner, op=dist.ReduceOp.AVG)
 
-        # 2) 只更新本地负责的参数
-        self.optimizer.step()
-
-        # 3) Broadcast 更新后的参数
-        for i, p in enumerate(self.all_params):
-            owner = i % self.world_size
-            dist.broadcast(p.data, src=owner)
-
-        # 4) 释放非 owner 的梯度（省显存）
+        # 2) 立即释放非本地梯度（省 75% 梯度显存）
         for i, p in enumerate(self.all_params):
             if i % self.world_size != self.rank:
                 p.grad = None
+
+        # 3) fp32 Adam 更新 → 同步回 fp16，然后释放 fp16 本地梯度
+        self._copy_grads_to_fp32()
+        for p in self.local_params:
+            p.grad = None  # 释放 fp16 梯度，fp32 副本已有
+        self.optimizer.step()
+        self._copy_fp32_to_model()
+
+        # 4) Broadcast 更新后的参数
+        for i, p in enumerate(self.all_params):
+            owner = i % self.world_size
+            dist.broadcast(p.data, src=owner)
 
     def _step_stage3(self):
         """ZeRO-3: 梯度 Reduce → 更新本地分片。
@@ -130,8 +155,10 @@ class ZeROOptimizer:
             owner = i % self.world_size
             dist.reduce(p.grad, dst=owner, op=dist.ReduceOp.AVG)
 
-        # 2) 更新本地参数分片
+        # 2) fp32 Adam 更新 → 同步回 fp16
+        self._copy_grads_to_fp32()
         self.optimizer.step()
+        self._copy_fp32_to_model()
 
         # 3) 把更新后的参数存回分片
         for i, p in enumerate(self.all_params):
@@ -202,3 +229,38 @@ def setup_zero(model, config, stage: int):
     )
 
     return model, optimizer
+
+
+class FP16OptimizerWrapper:
+    """fp16 模型的 fp32 优化器包装。
+
+    问题：fp16 参数直接用 Adam 会导致 grad² 溢出（256² > 65504）→ NaN。
+    方案：维护一份 fp32 参数副本做 Adam 更新，每步同步回 fp16。
+
+    这就是经典的 "mixed precision training" 中 optimizer 的做法。
+    """
+
+    def __init__(self, params, lr: float, weight_decay: float):
+        self.fp16_params = list(params)
+        # 创建 fp32 参数副本
+        self.fp32_params = [p.data.float().clone().requires_grad_(True) for p in self.fp16_params]
+        self.optimizer = torch.optim.AdamW(self.fp32_params, lr=lr, weight_decay=weight_decay)
+        self.param_groups = self.optimizer.param_groups
+
+    def step(self):
+        # 1) 把 fp16 梯度拷贝到 fp32
+        for fp32_p, fp16_p in zip(self.fp32_params, self.fp16_params):
+            if fp16_p.grad is not None:
+                fp32_p.grad = fp16_p.grad.float()
+
+        # 2) fp32 Adam 更新
+        self.optimizer.step()
+
+        # 3) 同步回 fp16 模型参数
+        for fp32_p, fp16_p in zip(self.fp32_params, self.fp16_params):
+            fp16_p.data.copy_(fp32_p.data)
+
+    def zero_grad(self):
+        self.optimizer.zero_grad()
+        for p in self.fp16_params:
+            p.grad = None

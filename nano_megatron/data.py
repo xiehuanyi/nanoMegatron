@@ -73,7 +73,7 @@ def create_dataloader(tokenizer, config, split: str = "train") -> DataLoader:
     # TP/SP：所有 rank 必须看到完全相同的数据（相同顺序），不用 DistributedSampler
     # 且 shuffle=False 防止不同 rank 的随机顺序不同
     strategy = getattr(config.parallel, "strategy", "ddp")
-    no_data_split = strategy in ("tp", "sp")
+    no_data_split = strategy in ("tp", "sp", "ep")
 
     if no_data_split:
         shuffle = False  # TP/SP: 关闭 shuffle 确保各 rank 数据一致

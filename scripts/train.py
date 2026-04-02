@@ -68,6 +68,17 @@ def main():
     model = PhiMoEForCausalLM(config.model)
     load_hf_weights(model, config.model.name)
 
+    # ── fp16 模型（显存紧张时使用）──
+    # ZeRO/EP/DDP 每卡有大量冗余参数，fp32 放不下 V100 32GB
+    # TP 把参数切分到多卡，fp32 能放下，不需要 fp16
+    # RMSNorm 和 loss 已在 fp32 下计算，避免 fp16 溢出
+    strategy = config.parallel.strategy
+    fp16_strategies = {"zero1", "zero2", "zero3", "ep", "ddp"}
+    if strategy in fp16_strategies:
+        model = model.half()
+        if is_main_process():
+            print("[CONFIG] Model converted to float16")
+
     # ── 梯度检查点（省显存）──
     if getattr(config.training, "gradient_checkpointing", False):
         model.model.enable_gradient_checkpointing()
@@ -96,11 +107,21 @@ def main():
     if custom_optimizer:
         optimizer = custom_optimizer
     else:
-        optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=config.training.lr,
-            weight_decay=config.training.weight_decay,
-        )
+        model_params = list(model.parameters())
+        is_fp16_model = model_params[0].dtype == torch.float16
+
+        if is_fp16_model:
+            # fp16 模型需要 fp32 optimizer（防止 Adam 的 grad² 溢出）
+            # 创建 fp32 参数副本做优化，每步同步回 fp16
+            from nano_megatron.parallel.zero import FP16OptimizerWrapper
+            optimizer = FP16OptimizerWrapper(model_params, lr=config.training.lr,
+                                             weight_decay=config.training.weight_decay)
+        else:
+            optimizer = torch.optim.AdamW(
+                model_params,
+                lr=config.training.lr,
+                weight_decay=config.training.weight_decay,
+            )
 
     # 线性 warmup + cosine decay
     from torch.optim.lr_scheduler import LambdaLR

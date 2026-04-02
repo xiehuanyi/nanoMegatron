@@ -22,10 +22,16 @@ CONFIG="configs/default.yaml"
 NPROC=4
 
 echo "=========================================="
-echo "Tensor Parallel (tp=4, fp32, ~20GB/GPU)"
+echo "Experiment 1/2: ZeRO-2 (fp16 model, ~19GB/GPU)"
 echo "=========================================="
-torchrun --nproc_per_node=$NPROC scripts/train.py --config $CONFIG --strategy tp --tp_size 4 2>&1 | tee logs/tp.log
-echo "TP EXIT CODE: $?"
+torchrun --nproc_per_node=$NPROC scripts/train.py --config $CONFIG --strategy zero2 2>&1 | tee logs/zero2.log
+echo "ZeRO-2 EXIT CODE: $?"
+
+echo "=========================================="
+echo "Experiment 2/2: Expert Parallel (ep=4, fp16 model)"
+echo "=========================================="
+torchrun --nproc_per_node=$NPROC scripts/train.py --config $CONFIG --strategy ep --ep_size 4 2>&1 | tee logs/ep.log
+echo "EP EXIT CODE: $?"
 
 echo "=========================================="
 echo "All experiments finished!"
