@@ -248,10 +248,11 @@ class FP16OptimizerWrapper:
         self.param_groups = self.optimizer.param_groups
 
     def step(self):
-        # 1) 把 fp16 梯度拷贝到 fp32
+        # 1) 逐参数拷贝 fp16 梯度到 fp32，立即释放 fp16 梯度（省显存）
         for fp32_p, fp16_p in zip(self.fp32_params, self.fp16_params):
             if fp16_p.grad is not None:
                 fp32_p.grad = fp16_p.grad.float()
+                fp16_p.grad = None  # 立即释放，避免 fp16 + fp32 梯度同时占用显存
 
         # 2) fp32 Adam 更新
         self.optimizer.step()

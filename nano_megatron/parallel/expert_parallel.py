@@ -32,26 +32,27 @@ import torch.distributed as dist
 # ============================================================
 
 class _EPAllReduceFunc(torch.autograd.Function):
-    """前向 AllReduce，反向也 AllReduce。
+    """前向 AllReduce SUM，反向直通（identity）。
 
-    EP 场景：前向时各 rank 算了部分 expert 的输出，AllReduce 求和得到完整结果。
-    反向时，梯度也需要 AllReduce（因为每个 rank 的 expert 都需要收到完整梯度）。
+    EP 场景：
+    - 前向：各 rank 的 partial output（只有本地 expert 部分非零）AllReduce SUM → 完整输出
+    - 反向：y = sum(x_i) 的梯度是 dx_i = dy（直接传过去，不需要再聚合）
+
+    注意：如果反向也做 AllReduce，梯度会被放大 N 倍（N=world_size），导致梯度爆炸 → NaN！
     """
 
     @staticmethod
     def forward(ctx, x, group):
         ctx.group = group
-        # 拷贝一份再 AllReduce，避免 in-place 操作影响 autograd
         output = x.clone()
         dist.all_reduce(output, group=group)
         return output
 
     @staticmethod
     def backward(ctx, grad):
-        # 反向：每个 rank 的 expert 需要对应的梯度，也是 AllReduce
-        grad_out = grad.clone()
-        dist.all_reduce(grad_out, group=ctx.group)
-        return grad_out, None
+        # Identity：每个 rank 的梯度直接传回本地 expert
+        # 非本地 expert 对应的梯度位置自然为 0（因为 forward 中那些位置的 x_i 是 0）
+        return grad, None
 
 
 # ============================================================
@@ -93,9 +94,8 @@ class EPSparseMoE(nn.Module):
         topk_weights, topk_indices = torch.topk(router_logits.float(), self.num_experts_per_tok, dim=-1)
         topk_weights = F.softmax(topk_weights, dim=-1).to(x.dtype)
 
-        # 广播路由决策，确保所有 rank 完全一致（防止浮点误差导致路由不同）
-        dist.broadcast(topk_indices, src=0, group=self.ep_group)
-        dist.broadcast(topk_weights, src=0, group=self.ep_group)
+        # EP 不需要广播路由：所有 rank 输入相同数据 + 相同 gate，结果 bitwise 一致
+        # （不像 TP，EP 没有 AllReduce 导致的浮点误差）
 
         # ── Step 2: 每个 rank 只算本地 expert ──
         output = torch.zeros_like(x_flat)
@@ -118,11 +118,63 @@ class EPSparseMoE(nn.Module):
         return output.view(B, L, D), router_logits
 
 
+class EPMixedOptimizer:
+    """EP 专用混合精度优化器。
+
+    问题：EP 的 non-expert 参数（attention 等）是冗余复制的，占大部分显存。
+    如果全部用 fp32 Adam，V100 32GB 放不下。
+
+    方案：
+    - Local expert 参数：fp32 Adam（expert 的 w1/w2/w3 梯度可能较大，需要 fp32 精度）
+    - Non-expert 参数（attention, embed, norm）：fp16 Adam（梯度通常较小）
+
+    这样省了 non-expert 参数的 fp32 副本 + fp32 Adam 开销。
+    """
+
+    def __init__(self, model, lr, weight_decay):
+        # 分离 expert 和 non-expert 参数
+        expert_params = []
+        other_params = []
+        for name, p in model.named_parameters():
+            if "local_experts" in name:
+                expert_params.append(p)
+            else:
+                other_params.append(p)
+
+        # Expert: fp32 optimizer
+        self.expert_fp16 = expert_params
+        self.expert_fp32 = [p.data.float().clone().requires_grad_(True) for p in expert_params]
+        self.expert_opt = torch.optim.AdamW(self.expert_fp32, lr=lr, weight_decay=weight_decay)
+
+        # Non-expert: fp16 SGD + momentum（Adam 的 exp_avg_sq 在 fp16 下会溢出导致 NaN）
+        # SGD 只有 momentum buffer（一阶），不会有 grad² 溢出问题
+        self.other_opt = torch.optim.SGD(other_params, lr=lr, momentum=0.9, weight_decay=weight_decay)
+
+        self.param_groups = self.expert_opt.param_groups + self.other_opt.param_groups
+
+    def step(self):
+        # Expert: fp16 grad → fp32 → Adam → sync back
+        for fp32_p, fp16_p in zip(self.expert_fp32, self.expert_fp16):
+            if fp16_p.grad is not None:
+                fp32_p.grad = fp16_p.grad.float()
+                fp16_p.grad = None
+        self.expert_opt.step()
+        for fp32_p, fp16_p in zip(self.expert_fp32, self.expert_fp16):
+            fp16_p.data.copy_(fp32_p.data)
+
+        # Non-expert: fp16 SGD（没有二阶矩，不会溢出）
+        self.other_opt.step()
+
+    def zero_grad(self):
+        self.expert_opt.zero_grad()
+        self.other_opt.zero_grad()
+
+
 def setup_ep(model, config):
     """对模型施加 Expert Parallel。
 
     Returns:
-        (model, None)
+        (model, EPMixedOptimizer)
     """
     ep_size = config.parallel.ep_size
     rank = dist.get_rank()
@@ -142,4 +194,8 @@ def setup_ep(model, config):
         original_moe = layer.block_sparse_moe
         layer.block_sparse_moe = EPSparseMoE(original_moe, ep_group)
 
-    return model, None
+    # 返回自定义混合精度优化器
+    optimizer = EPMixedOptimizer(
+        model, lr=config.training.lr, weight_decay=config.training.weight_decay,
+    )
+    return model, optimizer

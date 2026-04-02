@@ -112,7 +112,6 @@ def main():
 
         if is_fp16_model:
             # fp16 模型需要 fp32 optimizer（防止 Adam 的 grad² 溢出）
-            # 创建 fp32 参数副本做优化，每步同步回 fp16
             from nano_megatron.parallel.zero import FP16OptimizerWrapper
             optimizer = FP16OptimizerWrapper(model_params, lr=config.training.lr,
                                              weight_decay=config.training.weight_decay)
@@ -135,8 +134,10 @@ def main():
         progress = (step - warmup) / max(1, max_steps - warmup)
         return 0.5 * (1 + math.cos(math.pi * progress))
 
-    # ZeROOptimizer 不是 torch.optim.Optimizer 子类，需要对内部 optimizer 挂 scheduler
-    inner_opt = getattr(optimizer, "optimizer", optimizer)
+    # 自定义 optimizer 不是 torch.optim.Optimizer 子类，需要找到内部的真实 optimizer
+    inner_opt = getattr(optimizer, "optimizer",
+                 getattr(optimizer, "expert_opt",
+                 optimizer))
     scheduler = LambdaLR(inner_opt, lr_lambda)
 
     # ── 创建数据加载器 ──

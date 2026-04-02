@@ -44,10 +44,11 @@ class Trainer:
         dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
         self.dtype = dtype_map.get(config.training.dtype, torch.bfloat16)
 
-        # GradScaler 只在标准 optimizer + fp16 时使用
-        # ZeRO 等自定义 optimizer 不兼容 scaler，直接用 autocast 即可
+        # GradScaler 只在 fp32 模型 + fp16 autocast 场景下使用
+        # fp16 模型的梯度已经是 fp16，GradScaler 不能 unscale fp16 梯度
+        model_is_fp16 = next(model.parameters()).dtype == torch.float16
         is_standard_opt = isinstance(optimizer, torch.optim.Optimizer)
-        self.use_scaler = (self.dtype == torch.float16) and is_standard_opt
+        self.use_scaler = (self.dtype == torch.float16) and is_standard_opt and not model_is_fp16
         self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_scaler)
 
     def train(self):
@@ -125,6 +126,15 @@ class Trainer:
         with torch.amp.autocast("cuda", dtype=self.dtype):
             output = self.model(input_ids=batch["input_ids"], labels=batch["labels"])
             loss = output["loss"] / self.config.training.grad_accum_steps
+
+        # Debug: 首次检查 forward 是否已经 NaN
+        if not hasattr(self, "_debug_checked"):
+            self._debug_checked = True
+            if is_main_process():
+                logits = output["logits"]
+                print(f"  [DEBUG] First forward: loss={loss.item():.4f}, "
+                      f"logits_max={logits.abs().max().item():.1f}, "
+                      f"logits_nan={torch.isnan(logits).any().item()}")
 
         if self.use_scaler:
             self.scaler.scale(loss).backward()
