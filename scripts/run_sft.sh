@@ -21,11 +21,19 @@ export NCCL_TIMEOUT=300
 CONFIG="configs/default.yaml"
 NPROC=4
 
+# ZeRO-1: 只分片 optimizer states（fp16 model ~19GB/GPU）
 echo "=========================================="
-echo "Expert Parallel (ep=4, fp16 model, fp16 Adam)"
+echo "Experiment 1/2: ZeRO-1 (fp16 model)"
 echo "=========================================="
-torchrun --nproc_per_node=$NPROC scripts/train.py --config $CONFIG --strategy ep --ep_size 4 2>&1 | tee logs/ep.log
-echo "EP EXIT CODE: $?"
+torchrun --nproc_per_node=$NPROC scripts/train.py --config $CONFIG --strategy zero1 2>&1 | tee logs/zero1.log
+echo "ZeRO-1 EXIT CODE: $?"
+
+# ZeRO-3: 全分片 = FSDP 原理（fp16 model ~15GB/GPU）
+echo "=========================================="
+echo "Experiment 2/2: ZeRO-3 (fp16 model)"
+echo "=========================================="
+torchrun --nproc_per_node=$NPROC scripts/train.py --config $CONFIG --strategy zero3 2>&1 | tee logs/zero3.log
+echo "ZeRO-3 EXIT CODE: $?"
 
 echo "=========================================="
 echo "All experiments finished!"

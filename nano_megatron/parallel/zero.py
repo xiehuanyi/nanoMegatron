@@ -102,12 +102,19 @@ class ZeROOptimizer:
         for p in self.all_params:
             dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
 
-        # 2) 把 fp16 梯度拷贝到 fp32 副本 → Adam 在 fp32 上更新 → 同步回 fp16
+        # 2) 释放非本地梯度（省显存）
+        for i, p in enumerate(self.all_params):
+            if i % self.world_size != self.rank:
+                p.grad = None
+
+        # 3) fp32 Adam 更新，释放 fp16 梯度省显存
         self._copy_grads_to_fp32()
+        for p in self.local_params:
+            p.grad = None
         self.optimizer.step()
         self._copy_fp32_to_model()
 
-        # 3) Broadcast 更新后的参数
+        # 4) Broadcast 更新后的参数
         for i, p in enumerate(self.all_params):
             owner = i % self.world_size
             dist.broadcast(p.data, src=owner)
@@ -155,8 +162,15 @@ class ZeROOptimizer:
             owner = i % self.world_size
             dist.reduce(p.grad, dst=owner, op=dist.ReduceOp.AVG)
 
-        # 2) fp32 Adam 更新 → 同步回 fp16
+        # 2) 释放非本地梯度
+        for i, p in enumerate(self.all_params):
+            if i % self.world_size != self.rank:
+                p.grad = None
+
+        # 3) fp32 Adam 更新 → 同步回 fp16
         self._copy_grads_to_fp32()
+        for p in self.local_params:
+            p.grad = None
         self.optimizer.step()
         self._copy_fp32_to_model()
 
