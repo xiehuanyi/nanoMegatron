@@ -135,9 +135,10 @@ def main():
         return 0.5 * (1 + math.cos(math.pi * progress))
 
     # 自定义 optimizer 不是 torch.optim.Optimizer 子类，需要找到内部的真实 optimizer
-    inner_opt = getattr(optimizer, "optimizer",
-                 getattr(optimizer, "expert_opt",
-                 optimizer))
+    inner_opt = getattr(optimizer, "optimizer",       # ZeROOptimizer / FP16OptimizerWrapper
+                 getattr(optimizer, "expert_opt",    # EPMixedOptimizer
+                 getattr(optimizer, "sharded_opt",   # FSDPMixedOptimizer
+                 optimizer)))
     scheduler = LambdaLR(inner_opt, lr_lambda)
 
     # ── 创建数据加载器 ──
