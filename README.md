@@ -17,7 +17,8 @@
 | **ZeRO-3** | fp16 | 3.19 → 0.66 | 49 tok/s  | 26.6 GB |
 | **EP-4**   | fp16 | 3.53 → 1.04 | 170 tok/s | 21.0 GB |
 
-> 注：DDP 在 V100 32GB 上跑不起来（每卡需 ~45 GB：fp32 模型 15GB + Adam 30GB）。
+> 注：DDP 在 V100 32GB 上跑不起来。fp32 DDP 每卡需 ~61 GB：
+> 参数 15 GB + 梯度 15 GB + Adam 两个 state（`exp_avg` + `exp_avg_sq`）30 GB。
 
 ## 项目结构
 
