@@ -1,24 +1,33 @@
 """
-Expert Parallel（EP）—— 把不同 Expert 分配到不同 GPU。
+Expert Parallel（EP）—— 把不同 Expert 分配到不同 GPU，用 AllToAll 分发 token。
 
-原理：
-MoE 模型有 16 个 Expert，如果用 4 张 GPU 做 EP，每张卡只放 4 个 Expert。
-Router 决定每个 token 去哪两个 Expert 后，用 AllReduce 汇总各卡的结果。
+原理（DeepSpeed-MoE / Megatron-MoE 风格）：
+MoE 有 16 个 Expert，4 卡 EP 则每卡放 4 个 Expert。每个 rank 只处理自己数据的路由，
+然后通过 AllToAll 把 token 发送到 expert 所在的 rank 计算，最后 AllToAll 拿回结果。
 
-数据流（4 卡 EP，16 个 Expert，Top-2 路由）：
+数据流（4 卡 EP）：
 
-  所有 GPU 看到相同的 token（不做数据并行）
+  每个 rank 只看到自己的数据 slice（data parallel over EP ranks）
        │
-       ▼ Router 计算路由（replicated gate，结果一致）
+       ▼ Router 路由本地 token
        │
-  每个 GPU 只算属于自己的 4 个 Expert
+       ▼ Permute：按目标 expert 对 token 排序
        │
-       ▼ AllReduce（把各 GPU 的部分结果求和）
+       ▼ AllToAll #1（dispatch）：每个 token 只发给目标 expert 所在 rank
        │
-  每个 GPU 拿到完整的 MoE 输出
+       ▼ 本地 expert 计算（只算自己负责的 expert）
+       │
+       ▼ AllToAll #2（combine）：结果发回原 rank
+       │
+       ▼ Unpermute + 加权求和
+       │
+       ▼ 各 rank 拿到自己数据的完整输出
 
-好处：Expert 参数分散，单卡显存需求降低。
-代价：每层一次 AllReduce 通信。
+对比旧版 AllReduce SUM 的做法：
+- 旧版：所有 rank 对所有 token 算 router + 16 个 expert 全部冗余（只贡献自己的部分）→ AllReduce
+- 新版：每个 rank 只算自己数据的 router + 只跑本地 expert 处理分发来的 token
+- 通信量：从 O(B·S·D) 降到 O(top_k·B·S·D/ep_size)
+- 计算量：每个 expert GEMM 只执行一次（无冗余）
 """
 
 import torch
@@ -28,31 +37,46 @@ import torch.distributed as dist
 
 
 # ============================================================
-# AllReduce with autograd support
+# AllToAll 带 autograd 支持
 # ============================================================
 
-class _EPAllReduceFunc(torch.autograd.Function):
-    """前向 AllReduce SUM，反向直通（identity）。
-
-    EP 场景：
-    - 前向：各 rank 的 partial output（只有本地 expert 部分非零）AllReduce SUM → 完整输出
-    - 反向：y = sum(x_i) 的梯度是 dx_i = dy（直接传过去，不需要再聚合）
-
-    注意：如果反向也做 AllReduce，梯度会被放大 N 倍（N=world_size），导致梯度爆炸 → NaN！
-    """
+class _AllToAllFunc(torch.autograd.Function):
+    """AllToAll 的 autograd 包装。前向 AllToAll，反向也 AllToAll（对称）。"""
 
     @staticmethod
-    def forward(ctx, x, group):
+    def forward(ctx, x, output_split_sizes, input_split_sizes, group):
+        ctx.output_split_sizes = output_split_sizes
+        ctx.input_split_sizes = input_split_sizes
         ctx.group = group
-        output = x.clone()
-        dist.all_reduce(output, group=group)
+
+        world_size = dist.get_world_size(group)
+        total_out = sum(output_split_sizes)
+        output = torch.empty(total_out, *x.shape[1:], dtype=x.dtype, device=x.device)
+
+        dist.all_to_all_single(
+            output, x.contiguous(),
+            output_split_sizes=output_split_sizes,
+            input_split_sizes=input_split_sizes,
+            group=group,
+        )
         return output
 
     @staticmethod
     def backward(ctx, grad):
-        # Identity：每个 rank 的梯度直接传回本地 expert
-        # 非本地 expert 对应的梯度位置自然为 0（因为 forward 中那些位置的 x_i 是 0）
-        return grad, None
+        # 反向：交换 input/output 分片大小即可
+        total_out = sum(ctx.input_split_sizes)
+        grad_in = torch.empty(total_out, *grad.shape[1:], dtype=grad.dtype, device=grad.device)
+        dist.all_to_all_single(
+            grad_in, grad.contiguous(),
+            output_split_sizes=ctx.input_split_sizes,
+            input_split_sizes=ctx.output_split_sizes,
+            group=ctx.group,
+        )
+        return grad_in, None, None, None
+
+
+def all_to_all(x, output_split_sizes, input_split_sizes, group):
+    return _AllToAllFunc.apply(x, output_split_sizes, input_split_sizes, group)
 
 
 # ============================================================
@@ -60,12 +84,7 @@ class _EPAllReduceFunc(torch.autograd.Function):
 # ============================================================
 
 class EPSparseMoE(nn.Module):
-    """Expert Parallel 版 MoE 层。
-
-    每个 GPU 只持有 num_experts/ep_size 个 Expert。
-    所有 GPU 看到相同数据，用相同 gate 做路由（结果一致），
-    各自算本地 expert 的输出，最后 AllReduce 汇总。
-    """
+    """Expert Parallel 版 MoE 层（AllToAll 实现）。"""
 
     def __init__(self, original_moe, ep_group):
         super().__init__()
@@ -79,7 +98,7 @@ class EPSparseMoE(nn.Module):
         # Router（gate）在所有 GPU 上复制
         self.gate = original_moe.gate
 
-        # 只保留属于本 rank 的 expert
+        # 只保留本地 expert
         start = self.ep_rank * self.experts_per_rank
         end = start + self.experts_per_rank
         self.local_experts = nn.ModuleList(list(original_moe.experts[start:end]))
@@ -87,73 +106,93 @@ class EPSparseMoE(nn.Module):
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         B, L, D = x.shape
-        x_flat = x.view(-1, D)  # [N, D]
+        x_flat = x.view(-1, D)        # [N, D], N = B*L
+        N = x_flat.shape[0]
 
-        # ── Step 1: 路由（所有 rank 结果一致，因为 gate 和输入相同）──
-        router_logits = self.gate(x_flat)  # [N, num_experts]
-        topk_weights, topk_indices = torch.topk(router_logits.float(), self.num_experts_per_tok, dim=-1)
-        topk_weights = F.softmax(topk_weights, dim=-1).to(x.dtype)
+        # ── Step 1: 本地路由 ──
+        router_logits = self.gate(x_flat)                                          # [N, E]
+        topk_w, topk_i = torch.topk(router_logits.float(), self.num_experts_per_tok, dim=-1)
+        topk_w = F.softmax(topk_w, dim=-1).to(x.dtype)                             # [N, K]
 
-        # EP 不需要广播路由：所有 rank 输入相同数据 + 相同 gate，结果 bitwise 一致
-        # （不像 TP，EP 没有 AllReduce 导致的浮点误差）
+        # 展开成 [N*K] 的路由表：每个 token × K 次选择 = N*K 次分发
+        flat_expert_idx = topk_i.reshape(-1)          # [N*K]  每次分发的 expert id
+        flat_weight = topk_w.reshape(-1)              # [N*K]  对应的权重
+        # 对应原始 token 位置（每个 token 重复 K 次）
+        flat_token_idx = torch.arange(N, device=x.device).repeat_interleave(self.num_experts_per_tok)
 
-        # ── Step 2: 每个 rank 只算本地 expert ──
+        # ── Step 2: 按目标 rank 对分发排序（permute）──
+        # expert_id → rank: expert_id // experts_per_rank
+        dst_rank = flat_expert_idx // self.experts_per_rank                        # [N*K]
+        sort_order = torch.argsort(dst_rank)                                       # 稳定排序索引
+
+        sorted_expert = flat_expert_idx[sort_order]
+        sorted_token_idx = flat_token_idx[sort_order]
+        sorted_weight = flat_weight[sort_order]
+        sorted_x = x_flat[sorted_token_idx]                                        # [N*K, D] 按 dst rank 排好的 token
+
+        # 统计每个目标 rank 发送多少个 token
+        input_splits = torch.bincount(dst_rank, minlength=self.ep_size).tolist()
+
+        # 交换 split sizes 让对方知道会收到多少
+        input_splits_tensor = torch.tensor(input_splits, dtype=torch.long, device=x.device)
+        output_splits_tensor = torch.empty_like(input_splits_tensor)
+        dist.all_to_all_single(output_splits_tensor, input_splits_tensor, group=self.ep_group)
+        output_splits = output_splits_tensor.tolist()
+
+        # ── Step 3: AllToAll #1 — dispatch token 到目标 rank ──
+        recv_x = all_to_all(sorted_x, output_splits, input_splits, self.ep_group)
+        recv_expert = all_to_all(sorted_expert, output_splits, input_splits, self.ep_group)
+
+        # ── Step 4: 本地 expert 计算 ──
+        # recv_expert 是 global expert id，转成本地 id
+        local_expert_id = recv_expert - self.expert_start_idx                      # [M]，M = 收到的 token 数
+        recv_out = torch.zeros_like(recv_x)
+        for e in range(self.experts_per_rank):
+            mask = (local_expert_id == e)
+            if mask.any():
+                recv_out[mask] = self.local_experts[e](recv_x[mask])
+
+        # ── Step 5: AllToAll #2 — 把结果发回原 rank ──
+        sent_back = all_to_all(recv_out, input_splits, output_splits, self.ep_group)
+
+        # ── Step 6: unpermute + 加权求和 ──
+        # sent_back 的顺序和 sorted_x 一致；先乘权重，再还原到原 token 位置
+        weighted = sent_back * sorted_weight.unsqueeze(-1)
+
+        # 用 scatter_add 把 N*K 个加权结果累加回 N 个 token
         output = torch.zeros_like(x_flat)
-
-        for i in range(self.num_experts_per_tok):
-            expert_idx = topk_indices[:, i]     # [N]
-            weight = topk_weights[:, i]         # [N]
-
-            for local_e in range(self.experts_per_rank):
-                global_e = self.expert_start_idx + local_e
-                mask = (expert_idx == global_e)
-                if mask.any():
-                    expert_input = x_flat[mask]
-                    expert_output = self.local_experts[local_e](expert_input)
-                    output[mask] += weight[mask].unsqueeze(-1) * expert_output
-
-        # ── Step 3: AllReduce 合并各 rank 的部分结果（带 autograd 支持）──
-        output = _EPAllReduceFunc.apply(output, self.ep_group)
+        output.index_add_(0, sorted_token_idx, weighted)
 
         return output.view(B, L, D), router_logits
 
 
+# ============================================================
+# 优化器：分片参数 fp32 Adam + 非分片 fp16 SGD
+# ============================================================
+
 class EPMixedOptimizer:
     """EP 专用混合精度优化器。
 
-    问题：EP 的 non-expert 参数（attention 等）是冗余复制的，占大部分显存。
-    如果全部用 fp32 Adam，V100 32GB 放不下。
-
-    方案：
-    - Local expert 参数：fp32 Adam（expert 的 w1/w2/w3 梯度可能较大，需要 fp32 精度）
-    - Non-expert 参数（attention, embed, norm）：fp16 Adam（梯度通常较小）
-
-    这样省了 non-expert 参数的 fp32 副本 + fp32 Adam 开销。
+    - Local expert 参数：fp32 Adam（expert 梯度较大，需 fp32 精度）
+    - Non-expert 参数（attention, embed）：fp16 SGD（梯度小，省显存）
     """
 
     def __init__(self, model, lr, weight_decay):
-        # 分离 expert 和 non-expert 参数
-        expert_params = []
-        other_params = []
+        expert_params, other_params = [], []
         for name, p in model.named_parameters():
             if "local_experts" in name:
                 expert_params.append(p)
             else:
                 other_params.append(p)
 
-        # Expert: fp32 optimizer
         self.expert_fp16 = expert_params
         self.expert_fp32 = [p.data.float().clone().requires_grad_(True) for p in expert_params]
         self.expert_opt = torch.optim.AdamW(self.expert_fp32, lr=lr, weight_decay=weight_decay)
-
-        # Non-expert: fp16 SGD + momentum（Adam 的 exp_avg_sq 在 fp16 下会溢出导致 NaN）
-        # SGD 只有 momentum buffer（一阶），不会有 grad² 溢出问题
         self.other_opt = torch.optim.SGD(other_params, lr=lr, momentum=0.9, weight_decay=weight_decay)
 
         self.param_groups = self.expert_opt.param_groups + self.other_opt.param_groups
 
     def step(self):
-        # Expert: fp16 grad → fp32 → Adam → sync back
         for fp32_p, fp16_p in zip(self.expert_fp32, self.expert_fp16):
             if fp16_p.grad is not None:
                 fp32_p.grad = fp16_p.grad.float()
@@ -162,7 +201,6 @@ class EPMixedOptimizer:
         for fp32_p, fp16_p in zip(self.expert_fp32, self.expert_fp16):
             fp16_p.data.copy_(fp32_p.data)
 
-        # Non-expert: fp16 SGD（没有二阶矩，不会溢出）
         self.other_opt.step()
 
     def zero_grad(self):
@@ -171,15 +209,10 @@ class EPMixedOptimizer:
 
 
 def setup_ep(model, config):
-    """对模型施加 Expert Parallel。
-
-    Returns:
-        (model, EPMixedOptimizer)
-    """
+    """对模型施加 Expert Parallel（AllToAll 版本）。"""
     ep_size = config.parallel.ep_size
     rank = dist.get_rank()
 
-    # 创建 EP 进程组
     for i in range(0, dist.get_world_size(), ep_size):
         ranks = list(range(i, i + ep_size))
         group = dist.new_group(ranks)
@@ -188,14 +221,11 @@ def setup_ep(model, config):
 
     model = model.to(rank)
 
-    # 替换每层的 MoE 为 EP 版本
     base = getattr(model, "module", model)
     for layer in base.model.layers:
         original_moe = layer.block_sparse_moe
         layer.block_sparse_moe = EPSparseMoE(original_moe, ep_group)
 
-    # 返回自定义混合精度优化器
-    optimizer = EPMixedOptimizer(
-        model, lr=config.training.lr, weight_decay=config.training.weight_decay,
-    )
+    optimizer = EPMixedOptimizer(model, lr=config.training.lr,
+                                 weight_decay=config.training.weight_decay)
     return model, optimizer

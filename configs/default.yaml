@@ -17,7 +17,7 @@ model:
 
 data:
   dataset: "openai/gsm8k"
-  max_seq_len: 128
+  max_seq_len: 96
   batch_size: 1
   num_workers: 2
 

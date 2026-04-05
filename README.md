@@ -7,18 +7,45 @@
 
 ## 实验结果
 
-在 **4× V100 32GB** 上 SFT 1000 步（batch_size=1, seq_len=128, grad_accum=4）：
+在 **4× V100 32GB** 上 SFT 1000 步（batch_size=1, seq_len=96~128, grad_accum=4）：
 
 | 策略 | 精度 | Loss (start → end) | 吞吐 | 显存/卡 |
 |------|------|---------------------|------|---------|
 | **TP-4**   | fp32 | 6.69 → 1.03 | 45 tok/s  | 22.5 GB |
-| **ZeRO-1** | fp16 | 3.09 → 0.74 | 59 tok/s  | 27.6 GB |
-| **ZeRO-2** | fp16 | 3.09 → 0.80 | 57 tok/s  | 27.6 GB |
+| **ZeRO-1** | fp16 | 3.16 → 0.91 | 45 tok/s  | 27.6 GB |
+| **ZeRO-2** | fp16 | 3.10 → 0.94 | 45 tok/s  | 27.6 GB |
 | **ZeRO-3** | fp16 | 3.19 → 0.66 | 49 tok/s  | 26.6 GB |
-| **EP-4**   | fp16 | 3.53 → 1.04 | 170 tok/s | 21.0 GB |
+| **EP-4** (AllToAll) | fp16 | 3.50 → 1.00 | 190 tok/s | 21.1 GB |
 
 > 注：DDP 在 V100 32GB 上跑不起来。fp32 DDP 每卡需 ~61 GB：
 > 参数 15 GB + 梯度 15 GB + Adam 两个 state（`exp_avg` + `exp_avg_sq`）30 GB。
+
+## 和生产框架的差距
+
+为了让这个项目"一看就懂"，我刻意做了很多简化。和 Megatron-LM / DeepSpeed 相比：
+
+| 维度 | nanoMegatron (本项目) | 生产框架 (Megatron/DeepSpeed) |
+|------|----------------------|------------------------------|
+| **ZeRO 通信** | per-param（~2000 次 NCCL/步）| **flat buffer**（1 次/步，省 4-6 ms） |
+| **ZeRO backward** | backward 完再通信 | **backward hook overlap**（通信和计算重叠）|
+| **TP Attention** | 同步 AllReduce | **async AllReduce + wgrad GEMM overlap** |
+| **Sequence Parallel** | 未实现 | **LayerNorm/Dropout 沿 seq 切分**（省 TP× 激活显存）|
+| **EP 路由** | ~~AllReduce SUM~~ → **AllToAll** ✅ | AllToAll + permute/unpermute |
+| **Pipeline Parallel** | GPipe（存 M 个 activation）| **1F1B**（只存 P 个 activation）|
+| **ZeRO-3 参数分片** | 简单的 Linear/Embedding 替换 | **FlatParameter + 预取 + CUDA 多 stream** |
+| **Load balancing** | 无 | aux loss + capacity factor |
+
+**为什么有这些差距：**
+- 生产框架为了 speedup 做了大量工程（bucketing, overlap, async, prefetch, stream 调度）
+- nanoMegatron 为了"可读性"保留了最直观的实现
+- 例如 ZeRO flat buffer 需要额外 7.6 GB 内存（完整 flat grad），V100 32GB 放不下 3.8B 模型
+- async overlap 需要 `CUDA_DEVICE_MAX_CONNECTIONS=1` + 单独的 CUDA stream，逻辑复杂
+
+**EP 的改动（生产级做法）：**
+- **旧版（AllReduce SUM）**：每个 rank 对所有 token 算 router + 跑所有 16 个 expert（非本地的输出为 0）→ AllReduce 求和
+- **新版（AllToAll）**：每个 rank 只 router 本地 token → 按目标 expert 排序 → AllToAll 发到对应 rank → 本地 expert 只处理收到的 token → AllToAll 发回
+- 吞吐从 170 → 190 tok/s（~12%），通信量从 O(B·S·D) 降到 O(top_k·B·S·D/N)
+- 对于更大的 MoE（如 DeepSeek-V3 intermediate=14336），AllToAll 的优势会大得多
 
 ## 项目结构
 

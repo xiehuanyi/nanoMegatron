@@ -17,16 +17,31 @@ pip install -q datasets safetensors pyyaml 2>/dev/null
 export PYTHONPATH="/ibex/project/c2334/huanyi/nanoMegatron:$PYTHONPATH"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export NCCL_TIMEOUT=300
+export CUDA_DEVICE_MAX_CONNECTIONS=1  # 让 NCCL 和 compute 可以 overlap
 
 CONFIG="configs/default.yaml"
 NPROC=4
 
 echo "=========================================="
-echo "ZeRO-3 / FSDP (fp16, autograd.Function)"
+echo "ZeRO-1"
 echo "=========================================="
-torchrun --nproc_per_node=$NPROC scripts/train.py --config $CONFIG --strategy zero3 2>&1 | tee logs/zero3.log
-echo "ZeRO-3 EXIT CODE: $?"
+torchrun --nproc_per_node=$NPROC --master_port=29501 scripts/train.py --config $CONFIG --strategy zero1 2>&1 | tee logs/zero1.log
+echo "ZeRO-1 EXIT: $?"
+sleep 10
 
 echo "=========================================="
-echo "All experiments finished!"
+echo "ZeRO-2"
+echo "=========================================="
+torchrun --nproc_per_node=$NPROC --master_port=29502 scripts/train.py --config $CONFIG --strategy zero2 2>&1 | tee logs/zero2.log
+echo "ZeRO-2 EXIT: $?"
+sleep 10
+
+echo "=========================================="
+echo "EP (AllToAll dispatch, NEW)"
+echo "=========================================="
+torchrun --nproc_per_node=$NPROC --master_port=29503 scripts/train.py --config $CONFIG --strategy ep --ep_size 4 2>&1 | tee logs/ep.log
+echo "EP EXIT: $?"
+
+echo "=========================================="
+echo "All done!"
 echo "=========================================="
