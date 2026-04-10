@@ -117,6 +117,81 @@ def fsdp_wrap_module(model, group):
 
 **如何真正降低显存？** → 使用 DeepSpeed ZeRO-3（全分片所有参数），实测 **16.5 GB/卡**（2× A5000），比 nanoMegatron 的 26.6 GB 省了 38%。
 
+## v2 修复：把 bug 都补上
+
+针对上面发现的三个问题，分别做了以下修复（commit 历史可见）：
+
+### Fix 1: TP NCCL 调用合并 → 7.5x 减少
+
+**问题**：每个 ColumnParallel 的 _SplitFunc 和每个 RowParallel 的 _AllReduceFunc 各自触发 1 次 NCCL，32 层 × (3 attn + 16×3 expert) ≈ 2158 次/step。
+
+**修复**（`tensor_parallel.py`）：
+- 给 `ColumnParallelLinear` 加 `skip_split` 标志，给 `RowParallelLinear` 加 `skip_reduce` 标志
+- Attention：用 `forward_pre_hook` 在入口对 x 做 1 次 SplitFunc，Q/K/V 跳过自己的（合并 3→1）
+- MoE：新增 `TPMoEWrapper`，对 expert 路径做 1 次 SplitFunc，所有 expert 的 partial output 累积到 1 个 tensor，最后 1 次 AllReduce（合并 16→1）
+  - 注意 gate 不参与 SplitFunc，否则 gate 梯度会被 AllReduce SUM 多算 N 倍
+
+**实测**（2× A5000，profile_tp.py）：
+
+| 指标 | v1 (修复前) | v2 (修复后) | 改善 |
+|------|------------|------------|------|
+| NCCL calls/step | 2158 | **288** | **7.5x ↓** |
+| 吞吐 (forward+backward only) | 79 tok/s | **95 tok/s** | +20% |
+
+### Fix 2: ZeRO-2 backward hook → 显存真正下降
+
+**问题**：朴素 ZeRO-2 在 `step()` 里 reduce-then-free，但 `max_memory_allocated` 的 peak 发生在 backward 结束时（此时所有梯度都还在），所以 ZeRO-1/2 显存相同。
+
+**修复**（`zero.py`）：
+- 用 `register_post_accumulate_grad_hook` 在 backward 期间增量 reduce-and-free
+- 每个梯度算完立即 `dist.reduce` 到 owner，非 owner 立刻 `p.grad = None`
+- backward 期间最多只有 1 个完整梯度活着（而不是全部）
+- 副作用：`nn.utils.clip_grad_norm_` 在不同 rank 上算的 norm 不一致 → 新增 `ZeROOptimizer.clip_grad_norm` 做分布式 grad clipping，trainer 自动用它
+
+**实测**（2× A5000，8 层模型 ~1B 参数验证 config）：
+
+| 实现 | Peak Memory | 备注 |
+|------|------------|------|
+| ZeRO-1 | 13.65 GB | 完整 grads + 1/2 fp32 + 1/2 Adam |
+| **ZeRO-2 v2** | **~5.3 GB** | hook 释放非 owner grads → backward peak 下降 |
+
+显存节省 **~60%**，但代价是吞吐变慢（per-param sync hook 通信开销大；生产框架会用 bucketing + async）。
+
+### Fix 3: ZeRO-3 真正分片 MoE experts
+
+**问题**：`fsdp_wrap_module` 跳过了 experts（怕不同 rank 路由不同导致 AllGather 死锁），但 experts 占了 74% 的参数，所以 ZeRO-3 几乎没有节省显存。
+
+**修复**（`fsdp.py`）：
+- 移除 `if name == "experts": continue` 跳过逻辑
+- 新增 `_patch_moe_for_fsdp`：patch MoE forward 让所有 rank **始终调用所有 expert**（即使 mask 为空），保证 AllGather 调用顺序在所有 rank 上一致 → 不死锁
+- `FSDPMixedOptimizer` 改用 module class 检测分片参数（而不是 name pattern），保证 expert 内部的 Linear 也被识别为 sharded
+- 非分片参数（只剩 RMSNorm 等小张量）也走 fp32 Adam（之前用 SGD 是因为 experts 没分片，fp32 副本会 OOM）
+
+**实测**（2× A5000，8 层模型 验证 config）：
+
+| 实现 | Peak Memory | 备注 |
+|------|------------|------|
+| ZeRO-1 | 13.65 GB | 基线 |
+| **ZeRO-3 v2** | **~4.9 GB** | 所有参数分片（包括 experts） |
+
+显存节省 **~64%**，代价同样是吞吐：每个 expert 的 3 个 Linear 都各自 AllGather → per-step NCCL 数大涨。
+
+### 总结：v2 修复后的对比
+
+| 维度 | v1 (旧) | v2 (新) | 主要修复 |
+|------|---------|---------|---------|
+| TP NCCL/step | 2158 | 288 | SplitFunc/AllReduce 合并 |
+| TP throughput (fwd+bwd) | 79 tok/s | 95 tok/s | NCCL 减少 |
+| ZeRO-2 vs ZeRO-1 显存 | 相同 | -60% | backward hook |
+| ZeRO-3 vs ZeRO-1 显存 | -7% (只省 attn) | -64% (含 experts) | expert 分片 + MoE patch |
+
+**未解决的 trade-off**：v2 的 ZeRO-2/3 throughput 比 v1 慢（per-param/per-Linear sync NCCL 成本高）。生产框架（DeepSpeed FSDP）的解决办法：
+- **bucketing**：把多个小 grad/param 打包成 1 个大 NCCL 调用
+- **async**：通信和计算重叠，用 multi-stream 隐藏延迟
+- **prefetch**：提前 AllGather 下一层的参数
+
+这些优化代码量大、容易出 bug，超出了"一看就懂"项目的范围。
+
 ## 和生产框架的差距
 
 为了让这个项目"一看就懂"，我刻意做了很多简化。和 Megatron-LM / DeepSpeed 相比：

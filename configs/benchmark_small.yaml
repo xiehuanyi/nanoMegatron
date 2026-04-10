@@ -1,0 +1,44 @@
+# Small benchmark config — 用于在 2× A5000 24GB 上验证 ZeRO 修复
+# 减少 num_layers 让 3.8B → ~1B，能放下 ZeRO-1 的 peak
+
+model:
+  name: "microsoft/Phi-tiny-MoE-instruct"
+  hidden_size: 4096
+  num_layers: 8           # 32 → 8（验证用）
+  num_heads: 16
+  num_kv_heads: 4
+  head_dim: 128
+  intermediate_size: 448
+  num_experts: 16
+  num_experts_per_tok: 2
+  vocab_size: 32064
+  max_seq_len: 4096
+  rms_norm_eps: 1.0e-5
+  rope_theta: 10000.0
+
+data:
+  dataset: "openai/gsm8k"
+  max_seq_len: 64
+  batch_size: 1
+  num_workers: 2
+
+training:
+  lr: 2.0e-5
+  weight_decay: 0.01
+  warmup_steps: 5
+  max_steps: 30
+  grad_accum_steps: 1     # 简化（grad_accum>1 时 ZeRO-2 hook 会多次 reduce）
+  gradient_checkpointing: true
+  max_grad_norm: 1.0
+  dtype: "float16"
+  log_interval: 5
+  eval_interval: 99999
+  save_interval: 99999
+  output_dir: "checkpoints"
+
+parallel:
+  strategy: "ddp"
+  tp_size: 1
+  pp_size: 1
+  ep_size: 1
+  pp_micro_batches: 4

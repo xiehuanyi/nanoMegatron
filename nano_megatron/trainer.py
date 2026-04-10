@@ -79,13 +79,23 @@ class Trainer:
             avg_loss = total_loss / cfg.grad_accum_steps
 
             # 梯度裁剪 + 优化器更新
+            # ZeRO-2 用 backward hook 释放了非 owner 的梯度，nn.utils.clip_grad_norm_
+            # 在不同 rank 上算出的 norm 不一致，必须用 ZeROOptimizer.clip_grad_norm
+            has_dist_clip = hasattr(self.optimizer, "clip_grad_norm") and \
+                            getattr(self.optimizer, "stage", None) == 2
             if self.use_scaler:
                 self.scaler.unscale_(self.optimizer)
-                nn.utils.clip_grad_norm_(self.model.parameters(), cfg.max_grad_norm)
+                if has_dist_clip:
+                    self.optimizer.clip_grad_norm(cfg.max_grad_norm)
+                else:
+                    nn.utils.clip_grad_norm_(self.model.parameters(), cfg.max_grad_norm)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
-                nn.utils.clip_grad_norm_(self.model.parameters(), cfg.max_grad_norm)
+                if has_dist_clip:
+                    self.optimizer.clip_grad_norm(cfg.max_grad_norm)
+                else:
+                    nn.utils.clip_grad_norm_(self.model.parameters(), cfg.max_grad_norm)
                 self.optimizer.step()
             self.optimizer.zero_grad()
             if self.scheduler:

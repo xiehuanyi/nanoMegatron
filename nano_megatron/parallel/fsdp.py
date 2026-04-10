@@ -12,13 +12,21 @@ ZeRO-3 / FSDP —— 参数、梯度、优化器状态全部分片。
 数据流（以 Linear 为例）：
   forward:  AllGather 拿到完整权重 → matmul → 缓存完整权重给 backward
   backward: 用缓存的完整权重算梯度 → ReduceScatter 梯度 → 释放缓存
+
+MoE expert 分片修复（v2）：
+- 朴素实现跳过了 experts 的分片（experts 占 ~74% 参数 → ZeRO-3 几乎没节省）
+- 跳过原因：MoE routing 让不同 rank 跳过不同 expert → AllGather 错位 → 死锁
+- 修复：patch MoE forward 让 **所有** rank 始终调用 **所有** expert（即使 mask 为空），
+  这样 AllGather 调用顺序在所有 rank 上一致 → 不死锁
+- 空 mask 的 expert 调用：F.linear([0, in], W) 返回 [0, out]，AllGather 照常进行
 """
 
+import types
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
-import math
 
 
 # ============================================================
@@ -179,21 +187,15 @@ class FSDPEmbedding(nn.Module):
 # ============================================================
 
 def fsdp_wrap_module(model, group):
-    """递归替换模型中的 Linear 和 Embedding 为 FSDP 版本。
+    """递归替换模型中的 Linear 和 Embedding 为 FSDP 版本（包括 MoE experts）。
 
-    注意：MoE experts 不分片！原因：
-    1. intermediate_size=448 太小，分片通信开销 > 计算收益
-    2. MoE routing 导致不同 rank 跳过不同 expert → AllGather 不匹配 → 死锁
-    只分片大的 attention 投影层和 embedding。
+    v2：现在也分片 MoE experts。前提是 MoE forward 已经被 patch 成
+    "所有 rank 始终调用所有 expert"（见 _patch_moe_for_fsdp），避免 AllGather 错位。
     """
     rank = dist.get_rank(group)
     world_size = dist.get_world_size(group)
 
     for name, child in list(model.named_children()):
-        # 跳过 MoE experts（太小 + routing 导致通信不匹配）
-        if name == "experts":
-            continue
-
         if isinstance(child, nn.Linear):
             full_shape = child.weight.shape
             w_shard = shard_tensor(child.weight.data, rank, world_size)
@@ -211,24 +213,66 @@ def fsdp_wrap_module(model, group):
             fsdp_wrap_module(child, group)
 
 
+def _patch_moe_for_fsdp(moe):
+    """让 MoE forward 始终调用所有 expert（即使 mask 为空）。
+
+    原版 MoE forward 用 `if mask.any():` 跳过未激活的 expert。在 FSDP 下这会导致
+    不同 rank 跳过不同 expert（因为各 rank 的 routing 不同）→ FSDPLinear 的 AllGather
+    在不同 rank 上调用次数不同 → 死锁。
+
+    修复：去掉 `if mask.any():` 检查，所有 expert 始终调用（空输入时 F.linear 返回空）。
+    所有 rank 按相同顺序调用 → AllGather 对齐 → 不死锁。
+    """
+    def patched_forward(self, x):
+        B, L, D = x.shape
+        x_flat = x.view(-1, D)
+
+        router_logits = self.gate(x_flat)
+        topk_weights, topk_indices = torch.topk(
+            router_logits.float(), self.num_experts_per_tok, dim=-1
+        )
+        topk_weights = F.softmax(topk_weights, dim=-1).to(x.dtype)
+
+        output = torch.zeros_like(x_flat)
+        for i in range(self.num_experts_per_tok):
+            expert_idx = topk_indices[:, i]
+            weight = topk_weights[:, i]
+            for e_id in range(len(self.experts)):
+                mask = (expert_idx == e_id)
+                # 关键：始终调用 expert（即使 mask 全 False），保证 AllGather 顺序一致
+                expert_input = x_flat[mask]  # 可能是 [0, D]
+                expert_output = self.experts[e_id](expert_input)  # FSDPLinear 触发 AllGather
+                if expert_input.shape[0] > 0:
+                    output[mask] += weight[mask].unsqueeze(-1) * expert_output
+
+        return output.view(B, L, D), router_logits
+
+    moe.forward = types.MethodType(patched_forward, moe)
+
+
 class FSDPMixedOptimizer:
     """FSDP 混合精度优化器。
 
-    - 分片参数（FSDPLinear/FSDPEmbedding）：fp32 Adam（参数小，放得下 fp32 副本）
-    - 非分片参数（experts, RMSNorm 等）：fp16 SGD（参数大，fp32 会 OOM）
+    v2：通过 module class 检测分片参数（之前用 name pattern，会漏掉 experts 内的 Linear）。
+    现在 experts 也被分片了，所以"非分片"参数只剩 RMSNorm（很小，fp32 副本毫无压力）。
+    全部参数走 fp32 Adam。
     """
 
     def __init__(self, model, lr, weight_decay):
+        # 通过 module 类型检测分片参数
+        sharded_param_ids = set()
+        for module in model.modules():
+            if isinstance(module, (FSDPLinear, FSDPEmbedding)):
+                sharded_param_ids.add(id(module.weight))
+                if hasattr(module, "bias") and module.bias is not None:
+                    sharded_param_ids.add(id(module.bias))
+
         sharded_params = []
         other_params = []
-        for name, p in model.named_parameters():
+        for p in model.parameters():
             if not p.requires_grad:
                 continue
-            # FSDPLinear/FSDPEmbedding 的参数是分片的（很小）
-            is_sharded = any(isinstance(m, (FSDPLinear, FSDPEmbedding))
-                            for m in [model] if hasattr(m, 'weight') and m.weight is p)
-            # 简化判断：如果 module name 路径中有 q_proj/k_proj/v_proj/o_proj/embed/lm_head → 分片的
-            if any(k in name for k in ("q_proj", "k_proj", "v_proj", "o_proj", "embed_tokens", "lm_head")):
+            if id(p) in sharded_param_ids:
                 sharded_params.append(p)
             else:
                 other_params.append(p)
@@ -238,12 +282,19 @@ class FSDPMixedOptimizer:
         self.sharded_fp32 = [p.data.float().clone().requires_grad_(True) for p in sharded_params]
         self.sharded_opt = torch.optim.AdamW(self.sharded_fp32, lr=lr, weight_decay=weight_decay)
 
-        # 非分片参数：fp16 SGD
-        self.other_opt = torch.optim.SGD(other_params, lr=lr, momentum=0.9, weight_decay=weight_decay)
+        # 非分片参数（v2 修复后只剩 RMSNorm 的 weight/bias 等小张量）：也用 fp32 Adam
+        # （之前用 SGD 是因为非分片参数太大，fp32 副本会 OOM；现在 experts 已分片，问题消失）
+        self.other_fp16 = other_params
+        self.other_fp32 = [p.data.float().clone().requires_grad_(True) for p in other_params]
+        self.other_opt = torch.optim.AdamW(self.other_fp32, lr=lr, weight_decay=weight_decay) \
+            if other_params else None
 
-        self.param_groups = self.sharded_opt.param_groups + self.other_opt.param_groups
+        self.param_groups = self.sharded_opt.param_groups + (
+            self.other_opt.param_groups if self.other_opt else []
+        )
 
     def step(self):
+        # 分片参数
         for fp32_p, fp16_p in zip(self.sharded_fp32, self.sharded_fp16):
             if fp16_p.grad is not None:
                 fp32_p.grad = fp16_p.grad.float()
@@ -252,15 +303,24 @@ class FSDPMixedOptimizer:
         for fp32_p, fp16_p in zip(self.sharded_fp32, self.sharded_fp16):
             fp16_p.data.copy_(fp32_p.data)
 
-        self.other_opt.step()
+        # 非分片参数
+        if self.other_opt is not None:
+            for fp32_p, fp16_p in zip(self.other_fp32, self.other_fp16):
+                if fp16_p.grad is not None:
+                    fp32_p.grad = fp16_p.grad.float()
+                    fp16_p.grad = None
+            self.other_opt.step()
+            for fp32_p, fp16_p in zip(self.other_fp32, self.other_fp16):
+                fp16_p.data.copy_(fp32_p.data)
 
     def zero_grad(self):
         self.sharded_opt.zero_grad()
-        self.other_opt.zero_grad()
+        if self.other_opt is not None:
+            self.other_opt.zero_grad()
 
 
 def setup_fsdp(model, config):
-    """用 FSDP（ZeRO-3）包装模型。
+    """用 FSDP（ZeRO-3）包装模型（v2：experts 也被分片）。
 
     Returns:
         (model, FSDPMixedOptimizer)
@@ -272,7 +332,13 @@ def setup_fsdp(model, config):
     # 创建进程组
     group = dist.new_group(list(range(world_size)))
 
-    # 递归替换 Linear / Embedding 为 FSDP 版本（experts 不分片）
+    # ── v2 修复：先 patch MoE forward 让所有 rank 始终调用所有 expert ──
+    # 这是 expert 分片的前提（避免 AllGather 错位）
+    base = getattr(model, "module", model)
+    for layer in base.model.layers:
+        _patch_moe_for_fsdp(layer.block_sparse_moe)
+
+    # 递归替换 Linear / Embedding 为 FSDP 版本（包括 experts 内部的 w1/w2/w3）
     fsdp_wrap_module(model, group)
 
     # 返回混合精度优化器

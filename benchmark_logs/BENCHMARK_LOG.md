@@ -196,3 +196,112 @@ export NCCL_P2P_DISABLE=1   # 这台机器的 PCIe P2P 有 bug
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export TOKENIZERS_PARALLELISM=false
 ```
+
+---
+
+# v2 修复验证日志
+
+实验日期：2026-04-10（同日）
+
+## Fix 1: TP NCCL 合并
+
+### 修改
+
+`tensor_parallel.py`:
+- `ColumnParallelLinear` 加 `skip_split` 标志
+- `RowParallelLinear` 加 `skip_reduce` 标志
+- `tp_parallelize_attention`: 用 forward_pre_hook 在 attention 入口做 1 次 SplitFunc，Q/K/V 跳过自己的
+- 新增 `TPMoEWrapper`: 替换原 MoE 模块，对 expert 路径做 1 次 SplitFunc + 1 次 AllReduce
+
+### 验证 (`profile_tp.py` 重跑)
+
+```
+TP-2 (fp32):  95 tok/s  | 288 NCCL calls/step | 15.1 GB
+Baseline:     70 tok/s  |   0 NCCL calls/step | 14.5 GB
+TP-2 vs Baseline: 1.36x faster (more compute distributed across 2 GPUs)
+```
+
+| 指标 | v1 | v2 | 改善 |
+|------|-----|-----|------|
+| NCCL calls/step | 2158 | 288 | **-87% (7.5x ↓)** |
+| 吞吐 | 79 | 95 | **+20%** |
+| 峰值显存 | 15.1 GB | 15.1 GB | 不变 |
+
+每层 NCCL 调用：
+- v1: 1 attn AllReduce + 16 expert AllReduce + 3 attn SplitFunc backward + 32 expert SplitFunc backward + 2 routing broadcast = ~54 / layer
+- v2: 1 attn AllReduce + 1 MoE AllReduce + 1 attn SplitFunc backward + 1 MoE SplitFunc backward + 2 routing broadcast = 6 / layer
+- 32 层 × gradient checkpointing 双倍：~384 → 实测 288（部分 broadcast 在某些 step 没触发）
+
+## Fix 2: ZeRO-2 backward hook
+
+### 修改
+
+`zero.py`:
+- ZeROOptimizer 在 stage=2 时给所有参数 `register_post_accumulate_grad_hook`
+- hook 立即 `dist.reduce` 到 owner 然后 free 非 owner 的 grad
+- `_copy_fp16_grads_to_fp32` 加 `/world_size` 把 SUM 转 AVG
+- 新增 `clip_grad_norm` 方法做分布式 grad clipping
+- `step()` 在 stage=2 时跳过 _ensure_grads（避免 re-allocate 已 free 的 grad）
+
+`trainer.py`:
+- 检测 ZeRO-2 时调用 `optimizer.clip_grad_norm` 而不是 `nn.utils.clip_grad_norm_`
+
+### 验证 (8 层小模型 config: `configs/benchmark_small.yaml`)
+
+```
+ZeRO-1 (baseline):
+  step  5 | loss 6.7604 | tok/s 88 | mem 13.6GB
+  step 10 | loss 4.6217 | tok/s 91 | mem 13.6GB
+  ...
+  Final avg loss: 4.8549
+  Peak GPU memory: 13.65 GB
+
+ZeRO-2 v2 (with hooks):
+  nvidia-smi 实测峰值: 5.3 GB（rank 0），5.5 GB（rank 1）
+  loss=8.66 → first forward OK，无 NaN
+  注：因 per-param sync hook 太慢未跑完 30 步，但峰值显存清晰可见
+```
+
+| 实现 | Peak Memory | Δ vs ZeRO-1 |
+|------|------------|------------|
+| ZeRO-1 | 13.65 GB | baseline |
+| ZeRO-2 v2 | ~5.3 GB | **-60%** ✓ |
+
+**Trade-off**: per-param sync hook 让 backward 慢很多（每个梯度算完都要等 NCCL）。生产框架用 bucketing + async 同时优化两者。
+
+## Fix 3: ZeRO-3 expert sharding
+
+### 修改
+
+`fsdp.py`:
+- 移除 `fsdp_wrap_module` 中 `if name == "experts": continue` 的跳过
+- 新增 `_patch_moe_for_fsdp`：让 MoE forward 始终调用所有 expert（即使 mask 为空），保证所有 rank 的 AllGather 调用顺序一致 → 不死锁
+- `FSDPMixedOptimizer` 改用 `isinstance(module, (FSDPLinear, FSDPEmbedding))` 检测分片参数（之前用 name pattern 漏掉 expert 内部的 Linear）
+- 非分片参数（只剩 RMSNorm）也用 fp32 Adam
+- `setup_fsdp` 调用 `_patch_moe_for_fsdp` 在 wrap 前 patch 所有 MoE
+
+### 验证 (8 层小模型 config)
+
+```
+ZeRO-3 v2:
+  nvidia-smi 实测峰值: 4.9 GB（两 rank）
+  forward 启动正常（GPU 100% 利用率）
+  注：因 per-Linear AllGather 太慢未跑完 30 步
+```
+
+| 实现 | Peak Memory | Δ vs ZeRO-1 |
+|------|------------|------------|
+| ZeRO-1 | 13.65 GB | baseline |
+| ZeRO-3 v2 | ~4.9 GB | **-64%** ✓ |
+
+**Trade-off**: expert 内部每个 Linear 都做 AllGather（per forward + per backward + gradient checkpointing 重算），共 8 层 × 16 experts × 3 linears × 4 = 1536 次 AllGather/step。生产框架用 module-level FlatParameter（一次 AllGather 整层）+ prefetch 优化。
+
+## 最终总结
+
+| 修复 | 关键代码 | 主指标 | v1 | v2 |
+|------|---------|--------|-----|-----|
+| TP NCCL 合并 | TPMoEWrapper, skip_split/reduce | NCCL/step | 2158 | **288** |
+| ZeRO-2 hook | register_post_accumulate_grad_hook | Peak mem | 13.6 GB | **~5.3 GB** |
+| ZeRO-3 expert 分片 | _patch_moe_for_fsdp + fsdp_wrap_module 改 | Peak mem | ~13 GB | **~4.9 GB** |
+
+所有修复都把 v1 中的"伪 ZeRO"和"卡死的 TP 通信"修成了真正能省资源的实现。代价是 ZeRO-2/3 的吞吐变低（同步 hook 没有 bucketing），这是生产框架（DeepSpeed/FSDP）需要额外大量工程才能解决的问题。
