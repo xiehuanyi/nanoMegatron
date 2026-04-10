@@ -20,6 +20,103 @@
 > 注：DDP 在 V100 32GB 上跑不起来。fp32 DDP 每卡需 ~61 GB：
 > 参数 15 GB + 梯度 15 GB + Adam 两个 state（`exp_avg` + `exp_avg_sq`）30 GB。
 
+### 与 DeepSpeed 官方库对比
+
+在 **2× A5000 24GB** 上的对比（同模型、同数据、gradient checkpointing、fp16）：
+
+| 实现 | 策略 | 吞吐 | 显存/卡 | 能否跑起来 |
+|------|------|------|---------|-----------|
+| **nanoMegatron** | ZeRO-1 (N=2) | - | - | OOM（需 ~27 GB/卡） |
+| **nanoMegatron** | ZeRO-2 (N=2) | - | - | OOM（需 ~27 GB/卡） |
+| **nanoMegatron** | ZeRO-3 (N=2) | - | - | OOM（experts 不分片，需 ~25 GB） |
+| **nanoMegatron** | TP-2 (fp32, 无优化器) | 79 tok/s | 15.1 GB | 仅 forward+backward |
+| **DeepSpeed** | ZeRO-3 (N=2) | 极慢* | 16.5 GB | **能跑（全分片）** |
+
+> *注：此机器需设置 `NCCL_P2P_DISABLE=1`（PCIe P2P bug），导致 NCCL 走共享内存，3.8B 模型 ZeRO-3 的 AllGather 极慢（25 分钟 < 10 步）。
+> 在正常 NVLink/P2P 机器上 DeepSpeed ZeRO-3 的吞吐会好很多。此处对比重点是**显存占用**。
+
+**为什么 DeepSpeed 能跑但 nanoMegatron 不能？**
+- DeepSpeed ZeRO-3 对**所有参数**做全分片（包括 MoE experts），每卡只存 1/N
+- nanoMegatron FSDP **跳过了 MoE experts 的分片**（`fsdp.py` 第 192 行：`if name == "experts": continue`），因为 experts 太小（intermediate=448）且路由不一致可能导致 AllGather 死锁
+- 结果：nanoMegatron ZeRO-3 只分片了 ~1B/3.8B = 26% 的参数，显存节省有限
+
+### 深度分析：TP 为什么这么慢？
+
+通过 TP profiling（`scripts/profile_tp.py`），在 2× A5000 上测量：
+
+| 指标 | TP-2 (fp32) | Baseline (fp16, 单卡) |
+|------|------------|---------------------|
+| 吞吐 (forward+backward only) | 79 tok/s | 69 tok/s |
+| NCCL 调用次数/步 | **2158** | 0 |
+| 峰值显存 | 15.1 GB | 14.5 GB |
+
+**TP-2 的 forward+backward 竟然比单卡 fp16 还快（79 vs 69 tok/s）**，因为每个 GPU 只算一半的参数。但原始 V100 实验 TP-4 只有 45 tok/s，和 ZeRO-1/2 相当——开销都藏在 **完整训练循环** 里。
+
+**TP 慢的三大原因：**
+
+1. **海量 NCCL 调用**：每步 forward+backward **2158 次** collective 操作
+   - 32 层 × (1 Attention AllReduce + 16 Expert AllReduce + 2 Routing Broadcast) = ~608/pass
+   - Gradient checkpointing 导致 backward 重算 forward → NCCL 调用翻倍 → ~2158/步
+   - 对比：ZeRO-1/2 在 forward+backward 期间 **0 次** NCCL（只在 optimizer step 通信）
+   - 每次 NCCL 在 PCIe 上有 20-50μs latency → 2158 × 35μs ≈ **75ms overhead/步**
+
+2. **fp32 精度**：TP 不转 fp16（因为参数已分布在多卡，fp32 能放下）
+   - 参数存储 2x 大 → 显存带宽 2x 消耗
+   - 虽然 autocast 用 fp16 计算，但梯度是 fp32 → optimizer 更慢
+   - Adam 状态（fp32）对 TP 更贵：~2B params/GPU × 12 bytes/param = 24 GB → OOM on A5000
+
+3. **同步通信无重叠**：每个 RowParallel 的 AllReduce 是同步的
+   - AllReduce 期间 GPU 计算完全暂停
+   - 生产框架（Megatron-LM）用 **async AllReduce + GEMM overlap** 隐藏通信延迟
+
+**为什么 EP-4 (190 tok/s) 比 TP-4 (45 tok/s) 快 4x？**
+- EP 用 fp16（TP 用 fp32）→ 计算快 ~2x
+- EP 每层只有 **2 次 AllToAll**（dispatch + combine），TP 每层有 **~19 次 AllReduce**
+- EP 的 AllToAll 可以和 expert 计算 overlap，TP 的 AllReduce 是同步阻塞的
+
+### 深度分析：为什么 ZeRO-1/2/3 显存一样？
+
+V100 4 卡实验：ZeRO-1 = 27.6 GB，ZeRO-2 = 27.6 GB，ZeRO-3 = 26.6 GB。理论上应该递减，为什么几乎相同？
+
+**ZeRO-1 vs ZeRO-2：完全相同（27.6 GB）**
+
+`torch.cuda.max_memory_allocated()` 报告的是 **峰值** 显存。峰值发生在 **backward 结束后、`step()` 之前**：
+
+```
+backward 结束时（峰值！）:
+  ├── fp16 参数（完整）:     7.6 GB   ← ZeRO-1 和 ZeRO-2 都一样
+  ├── fp16 梯度（完整）:     7.6 GB   ← backward 期间累积，两者都是完整的
+  └── fp32 参数副本 (1/N):  3.8 GB   ← 已在 __init__ 分配
+  总计: ~19 GB + activations + CUDA overhead ≈ 27.6 GB
+```
+
+ZeRO-2 的优势（Reduce 到 owner vs AllReduce）**只在 `step()` 内部**才体现：
+- ZeRO-1 `step()`: AllReduce 梯度 → 释放非本地 → 优化
+- ZeRO-2 `step()`: Reduce 梯度到 owner → 释放非本地 → 优化
+
+但此时 peak 已经被 backward 的完整梯度锁定了！ZeRO-2 省的是 **step 期间** 的瞬时显存，而 `max_memory_allocated` 已经被 backward 的 peak 定格。
+
+**ZeRO-3 为什么也差不多（26.6 GB）？**
+
+nanoMegatron 的 FSDP 实现 **跳过了 MoE experts 的分片**：
+
+```python
+# fsdp.py 第 192 行
+def fsdp_wrap_module(model, group):
+    for name, child in list(model.named_children()):
+        if name == "experts":     # ← 跳过！
+            continue
+        # 只分片 Linear 和 Embedding...
+```
+
+模型参数分布：
+- **被分片的**（Attention + Embedding）：~1B params = 2 GB fp16
+- **未分片的**（MoE experts + gate + norms）：~2.8B params = 5.6 GB fp16
+
+结果：ZeRO-3 只分片了 26% 的参数，省了 ~1 GB → 26.6 GB vs 27.6 GB。
+
+**如何真正降低显存？** → 使用 DeepSpeed ZeRO-3（全分片所有参数），实测 **16.5 GB/卡**（2× A5000），比 nanoMegatron 的 26.6 GB 省了 38%。
+
 ## 和生产框架的差距
 
 为了让这个项目"一看就懂"，我刻意做了很多简化。和 Megatron-LM / DeepSpeed 相比：
