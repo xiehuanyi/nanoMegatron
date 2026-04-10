@@ -1,0 +1,36 @@
+W0410 12:08:23.559000 3533415 site-packages/torch/distributed/run.py:774] 
+W0410 12:08:23.559000 3533415 site-packages/torch/distributed/run.py:774] *****************************************
+W0410 12:08:23.559000 3533415 site-packages/torch/distributed/run.py:774] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W0410 12:08:23.559000 3533415 site-packages/torch/distributed/run.py:774] *****************************************
+[CONFIG] Strategy: tp
+[CONFIG] Model: microsoft/Phi-tiny-MoE-instruct
+[MODEL] Building model...
+[INFO] Loaded 1957 tensors from microsoft/Phi-tiny-MoE-instruct[INFO] Loaded 1957 tensors from microsoft/Phi-tiny-MoE-instruct[INFO] Loaded 1957 tensors from microsoft/Phi-tiny-MoE-instruct[INFO] Loaded 1957 tensors from microsoft/Phi-tiny-MoE-instruct
+
+
+
+[CONFIG] Gradient checkpointing enabled
+[TRAIN] Starting training for 10 steps...
+  [DEBUG] First forward: loss=8.2572, logits_max=39.5, logits_nan=False
+/home/huanyi/miniconda3/lib/python3.13/site-packages/torch/autograd/graph.py:829: UserWarning: c10d::broadcast_: an autograd kernel was not registered to the Autograd key(s) but we are trying to backprop through it. This may lead to silently incorrect behavior. This behavior is deprecated and will be removed in a future version of PyTorch. If your operator is differentiable, please ensure you have registered an autograd kernel to the correct Autograd key (e.g. DispatchKey::Autograd, DispatchKey::CompositeImplicitAutograd). If your operator is not differentiable, or to squash this warning and use the previous behavior, please register torch::CppFunction::makeFallthrough() to DispatchKey::Autograd. (Triggered internally at /pytorch/torch/csrc/autograd/autograd_not_implemented_fallback.cpp:62.)
+  return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+/home/huanyi/miniconda3/lib/python3.13/site-packages/torch/autograd/graph.py:829: UserWarning: c10d::broadcast_: an autograd kernel was not registered to the Autograd key(s) but we are trying to backprop through it. This may lead to silently incorrect behavior. This behavior is deprecated and will be removed in a future version of PyTorch. If your operator is differentiable, please ensure you have registered an autograd kernel to the correct Autograd key (e.g. DispatchKey::Autograd, DispatchKey::CompositeImplicitAutograd). If your operator is not differentiable, or to squash this warning and use the previous behavior, please register torch::CppFunction::makeFallthrough() to DispatchKey::Autograd. (Triggered internally at /pytorch/torch/csrc/autograd/autograd_not_implemented_fallback.cpp:62.)
+  return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+/home/huanyi/miniconda3/lib/python3.13/site-packages/torch/autograd/graph.py:829: UserWarning: c10d::broadcast_: an autograd kernel was not registered to the Autograd key(s) but we are trying to backprop through it. This may lead to silently incorrect behavior. This behavior is deprecated and will be removed in a future version of PyTorch. If your operator is differentiable, please ensure you have registered an autograd kernel to the correct Autograd key (e.g. DispatchKey::Autograd, DispatchKey::CompositeImplicitAutograd). If your operator is not differentiable, or to squash this warning and use the previous behavior, please register torch::CppFunction::makeFallthrough() to DispatchKey::Autograd. (Triggered internally at /pytorch/torch/csrc/autograd/autograd_not_implemented_fallback.cpp:62.)
+  return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+/home/huanyi/miniconda3/lib/python3.13/site-packages/torch/autograd/graph.py:829: UserWarning: c10d::broadcast_: an autograd kernel was not registered to the Autograd key(s) but we are trying to backprop through it. This may lead to silently incorrect behavior. This behavior is deprecated and will be removed in a future version of PyTorch. If your operator is differentiable, please ensure you have registered an autograd kernel to the correct Autograd key (e.g. DispatchKey::Autograd, DispatchKey::CompositeImplicitAutograd). If your operator is not differentiable, or to squash this warning and use the previous behavior, please register torch::CppFunction::makeFallthrough() to DispatchKey::Autograd. (Triggered internally at /pytorch/torch/csrc/autograd/autograd_not_implemented_fallback.cpp:62.)
+  return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+  step     2 | loss 7.6419 | lr 2.00e-05 | tok/s 146 | mem 15.0GB
+  step     4 | loss 6.6654 | lr 1.71e-05 | tok/s 162 | mem 15.0GB
+  step     6 | loss 6.6741 | lr 1.00e-05 | tok/s 160 | mem 15.2GB
+  step     8 | loss 7.2417 | lr 2.93e-06 | tok/s 160 | mem 15.3GB
+  step    10 | loss 6.2284 | lr 0.00e+00 | tok/s 154 | mem 15.5GB
+[TRAIN] Training finished.
+
+==================================================
+Training Summary
+==================================================
+  Final avg loss (last 100):  6.8903
+  Avg throughput:             156 tokens/sec
+  Peak GPU memory:            15.52 GB
+==================================================

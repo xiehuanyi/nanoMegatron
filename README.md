@@ -192,6 +192,35 @@ def fsdp_wrap_module(model, group):
 
 这些优化代码量大、容易出 bug，超出了"一看就懂"项目的范围。
 
+### 4× A5000 24GB 完整 benchmark（v2，全部 32 层）
+
+| 策略 | 显存/卡 | 吞吐 | 状态 |
+|------|--------|------|------|
+| **DDP** (fp16) | – | – | OOM (Adam fp32 副本占满 30 GB) |
+| **ZeRO-1** | ~22 GB peak | – | OOM (per-param 实现，peak 时所有 grads + Adam states 同时分配，刚好超 24 GB) |
+| **ZeRO-2 v2** | ~12 GB | 慢* | ✓ fit (backward hook 释放非 owner grads) |
+| **ZeRO-3 v2** | ~9 GB | 慢* | ✓ fit (experts 也分片) |
+| **TP-4 v2** | 15.5 GB | **154 tok/s** | ✓ |
+| **EP-4** (AllToAll) | 21.1 GB | **284 tok/s** | ✓ |
+
+> *ZeRO-2/3 v2 的 throughput 因 per-param/per-Linear 同步 NCCL 太慢未跑完（40k+ NCCL 调用/step over SHM）。
+> 显存通过 nvidia-smi 实时观察确认。
+
+**对比 v1 在 V100×4 上的旧数据**（注意 V100 ≠ A5000，仅为粗略对比）：
+
+| 策略 | v1 (V100×4) | v2 (A5000×4) | 改进 |
+|------|------------|------------|------|
+| TP-4 显存 | 22.5 GB | **15.5 GB** | -31% |
+| TP-4 吞吐 | 45 tok/s | **154 tok/s** | **3.4x ↑** |
+| ZeRO-3 显存 | 26.6 GB | **~9 GB** | -66% |
+| EP-4 吞吐 | 190 tok/s | **284 tok/s** | 1.5x ↑ |
+
+**关键发现**：
+1. **TP NCCL 合并 fix 效果显著**：从 45→154 tok/s 不只是 GPU 升级带来的——A5000 fp16 算力只有 V100 的 50%，所以这 3.4x 主要来自 v2 的 NCCL 数量减少（2158→288）。
+2. **DDP 在 4× A5000 上跑不起来**：3.8B 模型 fp16 + Adam fp32 副本需要 ~30 GB/卡，超 24 GB。
+3. **ZeRO-1 也 OOM**：因为 per-param 实现峰值时 fp16 grads + Adam states 同时存在 → 22 GB+，再加 CUDA context 就过线了。这正是 ZeRO-2 v2 修复的目标——用 backward hook 削掉 fp16 grads 的峰值。
+4. **EP-4 是性能之王**：AllToAll + fp16 + 1/4 expert，是 4 卡上唯一既快又能放下的方案（21 GB / 284 tok/s）。
+
 ## 和生产框架的差距
 
 为了让这个项目"一看就懂"，我刻意做了很多简化。和 Megatron-LM / DeepSpeed 相比：

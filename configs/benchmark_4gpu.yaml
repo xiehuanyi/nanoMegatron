@@ -1,0 +1,44 @@
+# 4-GPU benchmark config — 短跑，避开 per-param sync hook 的累计开销
+# 为了 ZeRO-2/3 v2 能在合理时间内跑完，把 grad_accum 设为 1，max_steps 设为 10
+
+model:
+  name: "microsoft/Phi-tiny-MoE-instruct"
+  hidden_size: 4096
+  num_layers: 32          # 完整 32 层
+  num_heads: 16
+  num_kv_heads: 4
+  head_dim: 128
+  intermediate_size: 448
+  num_experts: 16
+  num_experts_per_tok: 2
+  vocab_size: 32064
+  max_seq_len: 4096
+  rms_norm_eps: 1.0e-5
+  rope_theta: 10000.0
+
+data:
+  dataset: "openai/gsm8k"
+  max_seq_len: 96
+  batch_size: 1
+  num_workers: 2
+
+training:
+  lr: 2.0e-5
+  weight_decay: 0.01
+  warmup_steps: 2
+  max_steps: 10           # 10 步足以看出 throughput / mem
+  grad_accum_steps: 1     # 关键：v2 ZeRO-2/3 的 hook 太慢，每个 backward 都做大量 NCCL
+  gradient_checkpointing: true
+  max_grad_norm: 1.0
+  dtype: "float16"
+  log_interval: 2         # 早一点出 metrics
+  eval_interval: 99999
+  save_interval: 99999
+  output_dir: "checkpoints"
+
+parallel:
+  strategy: "ddp"
+  tp_size: 1
+  pp_size: 1
+  ep_size: 1
+  pp_micro_batches: 4

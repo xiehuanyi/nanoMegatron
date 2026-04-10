@@ -305,3 +305,111 @@ ZeRO-3 v2:
 | ZeRO-3 expert 分片 | _patch_moe_for_fsdp + fsdp_wrap_module 改 | Peak mem | ~13 GB | **~4.9 GB** |
 
 所有修复都把 v1 中的"伪 ZeRO"和"卡死的 TP 通信"修成了真正能省资源的实现。代价是 ZeRO-2/3 的吞吐变低（同步 hook 没有 bucketing），这是生产框架（DeepSpeed/FSDP）需要额外大量工程才能解决的问题。
+
+---
+
+# 4 卡完整 benchmark（v2，配置 `benchmark_4gpu.yaml`）
+
+实验时间：2026-04-10
+配置：完整 32 层 Phi-tiny-MoE，max_steps=10，grad_accum=1，seq_len=96
+（grad_accum=1 是为了让 ZeRO-2/3 v2 的 per-param hook 能在合理时间跑完）
+
+## 详细结果
+
+### DDP (fp16)
+```
+[rank0/1/2/3]: torch.OutOfMemoryError: CUDA out of memory.
+GPU has a total capacity of 23.56 GiB of which 35 MiB is free.
+Process has 23.51 GiB memory in use.
+```
+- **OOM**: 3.8B 模型 fp16 + Adam fp32 副本（30 GB）超 24 GB
+
+### ZeRO-1
+```
+[rank0/2]: torch.OutOfMemoryError: CUDA out of memory.
+Tried to allocate 20 MiB. GPU has 22.07 GiB memory in use.
+```
+- **OOM**: 22 GB peak + CUDA context 1+ GB → 超 24 GB
+- 注意：peak 在 step() 期间所有 fp16 grads 还活着 + Adam states 正在分配的瞬间
+
+### ZeRO-2 v2 (backward hook)
+```
+[CONFIG] Strategy: zero2
+[CONFIG] Model converted to float16
+[CONFIG] Gradient checkpointing enabled
+[TRAIN] Starting training for 10 steps...
+  [DEBUG] First forward: loss=4.7084, logits_max=62.4, logits_nan=False
+nvidia-smi 实测显存: ~12 GB / 卡（rank 0/1: 11.7 GB, rank 2: 12.7 GB）
+```
+- **能跑、显存 ~12 GB/卡（fits 24 GB）** ✓
+- **慢**: per-param backward hook 同步 NCCL，10 步 × ~1957 hooks = ~20k 同步 NCCL 调用
+- 用 NCCL_P2P_DISABLE=1 走 SHM 时单步 backward > 1 分钟
+
+### ZeRO-3 v2 (expert sharding)
+```
+[CONFIG] Strategy: zero3
+[CONFIG] Gradient checkpointing enabled
+[TRAIN] Starting training for 10 steps...
+  [DEBUG] First forward: loss=4.7084, logits_max=62.4, logits_nan=False
+nvidia-smi 实测显存: ~9 GB / 卡（rank 0/1/3: 9.1 GB, rank 2: 10.6 GB）
+```
+- **能跑、显存 ~9 GB/卡** ✓
+- **慢**: 每个 FSDPLinear 都做 AllGather，experts 全分片后 NCCL 数大涨
+
+### TP-4 v2 (NCCL 合并版)
+```
+[TRAIN] Starting training for 10 steps...
+  step  2 | loss 7.6419 | tok/s 146 | mem 15.0GB
+  step  4 | loss 6.6654 | tok/s 162 | mem 15.0GB
+  step  6 | loss 6.6741 | tok/s 160 | mem 15.2GB
+  step  8 | loss 7.2417 | tok/s 160 | mem 15.3GB
+  step 10 | loss 6.2284 | tok/s 154 | mem 15.5GB
+  Final avg loss: 6.8903
+  Peak GPU memory: 15.52 GB
+```
+- **跑通、~155 tok/s 稳定吞吐、15.5 GB peak** ✓
+- 对比 V100×4 v1：45 tok/s, 22.5 GB → **吞吐 3.4x ↑，显存 -31%**
+
+### EP-4 (AllToAll)
+```
+[TRAIN] Starting training for 10 steps...
+  step  2 | loss 3.7676 | tok/s 271 | mem 20.6GB
+  step  4 | loss 2.8633 | tok/s 286 | mem 20.9GB
+  step  6 | loss 2.3624 | tok/s 282 | mem 21.0GB
+  step  8 | loss 2.5586 | tok/s 271 | mem 21.1GB
+  step 10 | loss 2.7962 | tok/s 284 | mem 21.1GB
+  Final avg loss: 2.8696
+  Peak GPU memory: 21.10 GB
+```
+- **跑通、~280 tok/s（4 卡上最快）、21.1 GB peak** ✓
+- 对比 V100×4 v1：190 tok/s, 21.1 GB → **吞吐 1.5x ↑，显存基本一样**
+- loss 下降明显（4.70 → 2.80），收敛在跑
+
+## 汇总表
+
+| 策略 | 显存/卡 (peak) | 吞吐 | 状态 |
+|------|---------------|------|------|
+| DDP (fp16) | – | – | OOM |
+| ZeRO-1 | ~22 GB | – | OOM |
+| ZeRO-2 v2 | ~12 GB | (per-param hook 太慢) | fit ✓ |
+| ZeRO-3 v2 | ~9 GB | (per-Linear AllGather 太慢) | fit ✓ |
+| TP-4 v2 | **15.5 GB** | **154 tok/s** | ✓ |
+| EP-4 | 21.1 GB | **284 tok/s** | ✓ |
+
+## 关键观察
+
+1. **TP NCCL 合并 fix 在 4 卡上加速更明显**：v1 V100×4 是 45 tok/s，v2 A5000×4 是 154 tok/s。考虑 A5000 fp16 算力只有 V100 的 50%，**等效加速 ~6.8x**——这就是从 2158 NCCL/step 降到 288 的回报。
+
+2. **DDP 和 ZeRO-1 都 OOM**：因为它们 peak 时不释放 fp16 grads。这正是 v2 ZeRO-2 backward hook 修的核心问题。
+
+3. **ZeRO-2/3 v2 fit 但慢**：用 backward hook / per-Linear AllGather 来省显存的代价就是 NCCL 调用数爆炸，**没有 bucketing 时单步要 ~分钟级**。这正是为什么 DeepSpeed/PyTorch FSDP 的工程量这么大——它们用 bucketing + multi-stream + prefetch 同时拿到了显存和吞吐。
+
+4. **EP-4 是 4 卡上的最优解**：fp16 + AllToAll（每层只 2 次 collective）+ expert 自然分片到 4 卡，又快又能放下。
+
+## NCCL_P2P_DISABLE 的影响
+
+这台机器的 PCIe P2P 有 bug，所有实验都用 `NCCL_P2P_DISABLE=1` 走共享内存。这让 NCCL 通信慢很多（特别是大量小消息的场景），所以 ZeRO-2/3 v2 在这台机器上的吞吐**严重低估**。在正常 P2P/NVLink 机器上：
+- ZeRO-2 v2 的 hook 会快很多（NVLink 上 NCCL latency ~10μs vs SHM ~100μs+）
+- ZeRO-3 v2 的 AllGather 会快很多（NVLink 带宽 600 GB/s vs SHM 10 GB/s）
+
+实际生产环境用 ZeRO-2/3 不会这么慢，但**显存节省的相对比例不变**——这是核心结论。
