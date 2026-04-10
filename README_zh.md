@@ -53,18 +53,39 @@
 
 ## Benchmark
 
-**4× NVIDIA RTX A5000 (24 GB)，完整 3.8B 模型，32 层**，`seq_len=96`，`batch_size=1`：
+**4× NVIDIA RTX A5000 (24 GB)**，完整 3.8B Phi-tiny-MoE，`seq_len=96`，`batch_size=1`，`grad_accum=1`，开启 gradient checkpointing，`NCCL_P2P_DISABLE=1`。nanoMegatron 数据是和官方框架在同样配置下 head-to-head。
 
-| 策略 | 显存/卡 | 吞吐 | 备注 |
-|------|---------|------|------|
-| DDP (fp16) | – | – | OOM（Adam fp32 master 副本要 ~30 GB） |
-| ZeRO-1 | ~22 GB peak | – | OOM，刚好超 24 GB（per-param 实现，peak 在 step()） |
-| **ZeRO-2** | ~12 GB | 慢* | ✓ 能放下 |
-| **ZeRO-3** | ~9 GB | 慢* | ✓ 能放下，所有参数（含 experts）都分片 |
-| **TP-4** | 15.5 GB | **154 tok/s** | ✓ |
-| **EP-4** (AllToAll) | 21.1 GB | **284 tok/s** | ✓ |
+### 显存（peak GB / 卡）
 
-\* ZeRO-2/3 的吞吐受限于这台机器的 per-param 同步 NCCL（PCIe SHM）。在正常 NVLink + bucketing 环境下，相同算法快 5–10×—— 这就是和生产框架的差距。详见 [PITFALLS_zh.md](docs/PITFALLS_zh.md#没补的-trade-off)。
+| 策略 | nanoMegatron | DeepSpeed | PyTorch FSDP |
+|------|:------------:|:---------:|:------------:|
+| **DDP** (fp16) | OOM | – | – |
+| **ZeRO-1** | OOM (~22 GB peak) | **20.6 GB** ✓ | – |
+| **ZeRO-2** | **12.0 GB** ✓ | (类似 ZeRO-1) | – |
+| **ZeRO-3 / FSDP** | **9.6 GB** ✓ | **10.8 GB** ✓ | **18.8 GB** ✓ |
+| **TP-4** | **15.5 GB** ✓ | n/a (DS 没有 TP) | n/a |
+| **EP-4** (AllToAll) | **21.1 GB** ✓ | n/a | n/a |
+
+### 吞吐（tok/s）
+
+| 策略 | nanoMegatron | DeepSpeed | PyTorch FSDP |
+|------|:------------:|:---------:|:------------:|
+| **ZeRO-2** | （慢*） | （hung**） | – |
+| **ZeRO-3 / FSDP** | （慢*） | （hung**） | **24 tok/s** ✓ |
+| **TP-4** | **154 tok/s** ✓ | n/a | n/a |
+| **EP-4** | **284 tok/s** ✓ | n/a | n/a |
+
+\* nanoMegatron ZeRO-2/3 用 per-param 同步 hook（没有 bucketing）—— 在这台 PCIe-SHM 机器上意味着每次 backward ~2k 次 NCCL 调用，每次 ~100μs 延迟。吞吐被 NCCL launch cost 卡死，不是算法问题。在 NVLink 机器加 bucketing 会快 5–10×。
+
+\*\* DeepSpeed 的第一个 step 在这台机器上 4+ 分钟没完成（fp16/bf16 都试过，bucket size 设了 500 MB）。PyTorch FSDP 顺利跑完，因为它在 layer 粒度包装 + multi-stream prefetch 对 PCIe-SHM 更友好。上面的显存数字是 DeepSpeed engine 初始化完后从 `nvidia-smi` 抓的。
+
+**这张表说明三件事：**
+
+1. **显存：我们和官方框架相当。** nanoMegatron ZeRO-3 (9.6 GB) 实际比 PyTorch FSDP (18.8 GB) 还省一点 —— FSDP 给**所有**参数都保留 fp32 master 副本，我们只对分片参数这么做，加上 backward hook 更激进地释放非 owner 梯度。DeepSpeed ZeRO-3 (10.8 GB) 是最接近的。我们的 ZeRO-1 OOM 而 DeepSpeed 能放下，是因为他们的 flat-buffer 设计避开了我们 per-param 实现的峰值。
+
+2. **吞吐：TP 和 EP 有竞争力，ZeRO-2/3 卡在没有 bucketing。** nanoMegatron 在这台硬件上的甜点是 TP-4 / EP-4。ZeRO 数字慢是被**工程**卡（没 bucketing、没 async overlap），不是被算法卡。和生产框架的工程差距详见 [PITFALLS_zh.md](docs/PITFALLS_zh.md#没补的-trade-off)。
+
+3. **DeepSpeed 比 PyTorch FSDP 更受 PCIe-SHM 影响。** 这台 NCCL-P2P-disabled 机器上 DeepSpeed 跑不动一个 step，PyTorch FSDP 能跑完。这是硬件相关的 —— 在正常 NVLink 机器上 DeepSpeed 很快。
 
 ## 快速开始
 

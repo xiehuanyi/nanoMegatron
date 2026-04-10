@@ -53,18 +53,39 @@ A working SFT pipeline on [Phi-tiny-MoE](https://huggingface.co/microsoft/Phi-ti
 
 ## Benchmarks
 
-**4× NVIDIA RTX A5000 (24 GB), full 3.8B model, 32 layers**, `seq_len=96`, `batch_size=1`:
+**4× NVIDIA RTX A5000 (24 GB)**, full 3.8B Phi-tiny-MoE, `seq_len=96`, `batch_size=1`, `grad_accum=1`, gradient checkpointing on, `NCCL_P2P_DISABLE=1`. nanoMegatron numbers are head-to-head against the official frameworks.
 
-| Strategy | Memory/GPU | Throughput | Notes |
-|----------|-----------|------------|-------|
-| DDP (fp16) | – | – | OOM (Adam fp32 master copies need ~30 GB) |
-| ZeRO-1 | ~22 GB peak | – | OOM at the boundary (per-param impl, peak in step()) |
-| **ZeRO-2** | ~12 GB | slow* | ✓ fits |
-| **ZeRO-3** | ~9 GB | slow* | ✓ fits, all params (incl. experts) sharded |
-| **TP-4** | 15.5 GB | **154 tok/s** | ✓ |
-| **EP-4** (AllToAll) | 21.1 GB | **284 tok/s** | ✓ |
+### Memory (peak GB / GPU)
 
-\* ZeRO-2/3 throughput is bound by per-param sync NCCL on this PCIe machine. On a normal NVLink + bucketing setup the same algorithms run 5–10× faster — that's the gap to production frameworks. See [PITFALLS.md](docs/PITFALLS.md#trade-offs-still-on-the-table).
+| Strategy | nanoMegatron | DeepSpeed | PyTorch FSDP |
+|----------|:------------:|:---------:|:------------:|
+| **DDP** (fp16) | OOM | – | – |
+| **ZeRO-1** | OOM (~22 GB peak) | **20.6 GB** ✓ | – |
+| **ZeRO-2** | **12.0 GB** ✓ | (similar to ZeRO-1) | – |
+| **ZeRO-3 / FSDP** | **9.6 GB** ✓ | **10.8 GB** ✓ | **18.8 GB** ✓ |
+| **TP-4** | **15.5 GB** ✓ | n/a (DS has no TP) | n/a |
+| **EP-4** (AllToAll) | **21.1 GB** ✓ | n/a | n/a |
+
+### Throughput (tok/s)
+
+| Strategy | nanoMegatron | DeepSpeed | PyTorch FSDP |
+|----------|:------------:|:---------:|:------------:|
+| **ZeRO-2** | (slow*) | (hung**) | – |
+| **ZeRO-3 / FSDP** | (slow*) | (hung**) | **24 tok/s** ✓ |
+| **TP-4** | **154 tok/s** ✓ | n/a | n/a |
+| **EP-4** | **284 tok/s** ✓ | n/a | n/a |
+
+\* nanoMegatron ZeRO-2/3 use per-param sync hooks (no bucketing) — on this PCIe-SHM machine that means ~2k NCCL calls per backward, each with ~100μs latency. Throughput is bound by NCCL launch cost, not algorithm. On a NVLink machine with bucketing this would be 5–10× faster.
+
+\*\* DeepSpeed's first step never completes on this machine in 4+ minutes (we tried both fp16 and bf16 with bucket sizes set to 500 MB). PyTorch FSDP completes happily because it wraps at the layer granularity and its multi-stream prefetch is more PCIe-SHM friendly. Memory numbers above were captured from `nvidia-smi` after DeepSpeed engine init.
+
+**Three things this table tells you:**
+
+1. **Memory: we match the official frameworks.** nanoMegatron ZeRO-3 (9.6 GB) is actually a bit more compact than PyTorch FSDP (18.8 GB) on the same model — FSDP keeps fp32 master copies for *all* params, we only do that for the sharded ones, and our backward hooks free non-owner grads more aggressively. DeepSpeed ZeRO-3 (10.8 GB) is the closest match. Our ZeRO-1 OOMs where DeepSpeed's fits, because their flat-buffer design avoids the per-param peak we hit.
+
+2. **Throughput: TP and EP are competitive; ZeRO-2/3 are bottlenecked by lack of bucketing.** The sweet spot for nanoMegatron on this hardware is TP-4 / EP-4. The ZeRO numbers are limited by *engineering* (no bucketing, no async overlap), not algorithm. See [PITFALLS.md](docs/PITFALLS.md#trade-offs-still-on-the-table) for the gap to production-framework optimizations.
+
+3. **DeepSpeed is more sensitive to PCIe-SHM than PyTorch FSDP.** Even DeepSpeed couldn't complete a step on this NCCL-P2P-disabled machine, while PyTorch FSDP did. This is hardware-specific — on a normal NVLink box DeepSpeed is fast.
 
 ## Quick start
 

@@ -7,6 +7,7 @@ PyTorch 原生 FSDP 对比 benchmark。
 
 import os
 import time
+import functools
 import torch
 import torch.nn as nn
 import torch.distributed as dist
@@ -24,8 +25,13 @@ def main():
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
 
-    config = load_config("configs/benchmark.yaml")
-    max_steps = 50
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, default="configs/benchmark.yaml")
+    parser.add_argument("--max_steps", type=int, default=50)
+    args = parser.parse_args()
+    config = load_config(args.config)
+    max_steps = args.max_steps
 
     if is_main_process():
         print(f"[BENCHMARK] PyTorch FSDP on {dist.get_world_size()} GPUs")
@@ -46,7 +52,8 @@ def main():
         buffer_dtype=torch.float16,
     )
 
-    auto_wrap_policy = transformer_auto_wrap_policy(
+    auto_wrap_policy = functools.partial(
+        transformer_auto_wrap_policy,
         transformer_layer_cls={PhiMoEDecoderLayer},
     )
 
@@ -69,6 +76,9 @@ def main():
 
     if is_main_process():
         print(f"[BENCHMARK] Starting {max_steps} steps...")
+
+    log_interval = max(1, max_steps // 5)
+    warmup_steps = max(2, max_steps // 5)
 
     throughputs = []
     for step in range(1, max_steps + 1):
@@ -96,13 +106,13 @@ def main():
         dt = time.time() - t0
         tokens_per_sec = batch["input_ids"].numel() * config.training.grad_accum_steps / dt
 
-        if step >= 10:
+        if step > warmup_steps:
             throughputs.append(tokens_per_sec)
 
-        if step % 10 == 0 and is_main_process():
+        if (step % log_interval == 0 or step == 1) and is_main_process():
             mem = torch.cuda.max_memory_allocated() / 1e9
             avg_loss = total_loss / config.training.grad_accum_steps
-            print(f"  step {step:5d} | loss {avg_loss:.4f} | tok/s {tokens_per_sec:.0f} | mem {mem:.1f}GB")
+            print(f"  step {step:5d} | loss {avg_loss:.4f} | tok/s {tokens_per_sec:.0f} | mem {mem:.1f}GB", flush=True)
 
     if is_main_process():
         mem = torch.cuda.max_memory_allocated() / 1e9

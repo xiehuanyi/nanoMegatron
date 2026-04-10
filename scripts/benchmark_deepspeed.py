@@ -25,8 +25,9 @@ from nano_megatron.model import PhiMoEForCausalLM, load_hf_weights
 from nano_megatron.data import create_dataloader
 
 
-def get_ds_config(stage, lr, batch_size, grad_accum, dtype="fp16"):
-    """生成 DeepSpeed 配置。"""
+def get_ds_config(stage, lr, batch_size, grad_accum, dtype="bf16"):
+    """生成 DeepSpeed 配置。bf16 比 fp16 快（不用 dynamic loss scale 探测）。"""
+    use_bf16 = (dtype == "bf16")
     config = {
         "train_batch_size": batch_size * grad_accum * dist.get_world_size(),
         "train_micro_batch_size_per_gpu": batch_size,
@@ -45,16 +46,22 @@ def get_ds_config(stage, lr, batch_size, grad_accum, dtype="fp16"):
             "params": {
                 "warmup_min_lr": 0,
                 "warmup_max_lr": lr,
-                "warmup_num_steps": 10,
-                "total_num_steps": 50,
+                "warmup_num_steps": 2,
+                "total_num_steps": 10,
             }
         },
         "gradient_clipping": 1.0,
         "zero_optimization": {
             "stage": stage,
+            "allgather_partitions": True,
+            "allgather_bucket_size": 5e8,
+            "reduce_scatter": True,
+            "reduce_bucket_size": 5e8,
+            "overlap_comm": True,
+            "contiguous_gradients": True,
         },
-        "bf16": {"enabled": False},
-        "fp16": {"enabled": True, "loss_scale": 0, "initial_scale_power": 16},
+        "bf16": {"enabled": use_bf16},
+        "fp16": {"enabled": not use_bf16, "loss_scale": 128, "initial_scale_power": 7} if not use_bf16 else {"enabled": False},
         "wall_clock_breakdown": False,
     }
 
@@ -124,6 +131,9 @@ def main():
     if is_main_process():
         print(f"[BENCHMARK] Starting {args.max_steps} steps (grad_accum={grad_accum})...")
 
+    log_interval = max(1, args.max_steps // 5)
+    warmup_steps = max(2, args.max_steps // 5)
+
     throughputs = []
     for step in range(1, args.max_steps + 1):
         t0 = time.time()
@@ -146,13 +156,13 @@ def main():
         dt = time.time() - t0
         tokens_per_sec = batch["input_ids"].numel() * grad_accum / dt
 
-        if step >= 10:  # 跳过 warmup
+        if step > warmup_steps:
             throughputs.append(tokens_per_sec)
 
-        if step % 10 == 0 and is_main_process():
+        if (step % log_interval == 0 or step == 1) and is_main_process():
             mem = torch.cuda.max_memory_allocated() / 1e9
             avg_loss = total_loss / grad_accum
-            print(f"  step {step:5d} | loss {avg_loss:.4f} | tok/s {tokens_per_sec:.0f} | mem {mem:.1f}GB")
+            print(f"  step {step:5d} | loss {avg_loss:.4f} | tok/s {tokens_per_sec:.0f} | mem {mem:.1f}GB", flush=True)
 
     if is_main_process():
         mem = torch.cuda.max_memory_allocated() / 1e9
