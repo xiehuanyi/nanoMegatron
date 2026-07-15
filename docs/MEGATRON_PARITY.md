@@ -1,0 +1,107 @@
+# Megatron Parity Tracker
+
+目标不是只复现并行算法，而是在相同模型、batch、序列长度、精度、并行拓扑和
+attention backend 下，让 nanoMegatron 达到 Megatron Core 的训练吞吐和峰值显存。
+
+## 验收口径
+
+- 速度：3 次独立运行的中位吞吐 `nano / Megatron >= 0.95`。
+- 显存：每卡峰值 `nano / Megatron <= 1.05`，同时记录 allocated、reserved 和
+  `nvidia-smi` 三种口径。
+- 稳定性：稳态 step time 的变异系数不超过 3%，无 OOM、NaN 或 collective hang。
+- 正确性：固定 seed 的 loss/梯度与参考实现在约定精度容差内；性能达标不能以
+  改变模型语义、少算 token 或跳过 optimizer step 为代价。
+- 所有结果必须记录 git revision、Megatron revision、GPU、driver、CUDA、PyTorch、
+  Transformer Engine/NCCL 版本和完整命令。
+
+状态：`DONE` 已实现并验证，`PARTIAL` 有实现但未达到生产语义/性能，`TODO` 未实现，
+`N/A` 当前模型不适用。
+
+## 特性清单
+
+| ID | Megatron 特性 | nanoMegatron | 状态 | 性能/显存验收点 | 优先级 |
+|---|---|---|---|---|---|
+| M01 | Dense GPT/Qwen 模型 | 新增 Qwen3 dense benchmark model | PARTIAL | 参数量、层结构、loss 对齐 | P0 |
+| M02 | FP32/FP16/BF16 混合精度 | FP16 master weights；策略间不统一 | PARTIAL | loss scale、master grad/weight 布局对齐 | P0 |
+| M03 | Tensor Parallel | Column/Row parallel，Phi-MoE 路径 | PARTIAL | TP=2/4 吞吐、显存、通信次数 | P0 |
+| M04 | Sequence Parallel | 当前仅 stub/有限路径 | PARTIAL | TP+SP 激活显存和 numerics | P0 |
+| M05 | Data Parallel DDP | 手写 all-reduce | DONE | bucket size、overlap 后达到 DP 基线 | P0 |
+| M06 | Distributed Optimizer | dtype flat buffer + 等长 tensor shard + RS/AG | PARTIAL | D1 三次运行验收中 | P0 |
+| M07 | Pipeline Parallel | GPipe | PARTIAL | 1F1B、bubble、P2P overlap | P1 |
+| M08 | Interleaved/virtual PP | 无 | TODO | VPP schedule 与 bubble | P1 |
+| M09 | Context Parallel | 无 | TODO | 长序列 ring P2P/all-gather 路径 | P1 |
+| M10 | Expert Parallel | AllToAll dispatch | PARTIAL | token permutation、grouped GEMM、负载均衡 | P1 |
+| M11 | Expert Tensor Parallel | 无独立 ETP | TODO | EP/ETP folding 拓扑 | P2 |
+| M12 | TP 通信计算重叠 | 同步 collective | TODO | `tp-comm-overlap` 同级隐藏率 | P0 |
+| M13 | DP grad reduce overlap | post-accumulate hook 异步 ReduceScatter | PARTIAL | D1 backward/RS overlap | P0 |
+| M14 | DP param gather overlap | bucket 异步 AllGather，尚未跨 step overlap | PARTIAL | optimizer 后 AG/next forward overlap | P0 |
+| M15 | PP 通信重叠 | 无 | TODO | send/recv 与计算重叠 | P1 |
+| M16 | Contiguous param/grad buffers | 参数/梯度按 dtype 连续分桶，rank shard 等长 | PARTIAL | 分配次数、碎片、通信 bucket 对齐 | P0 |
+| M17 | Activation recomputation | 整层 checkpoint | PARTIAL | full/selective 两档速度/显存曲线 | P0 |
+| M18 | Selective recomputation | 无 | TODO | core-attn selective recompute | P1 |
+| M19 | Activation CPU offload | 无 | TODO | 异步 D2H/H2D overlap | P2 |
+| M20 | Fused attention | PyTorch SDPA | PARTIAL | A100/H100 与 TE FlashAttention 对标 | P0 |
+| M21 | Fused RMSNorm | Python/PyTorch 实现 | TODO | TE/Apex 或 Triton kernel 对标 | P0 |
+| M22 | Fused QKV/MLP GEMM | Q/K/V 与 gate/up 分离 | TODO | GEMM 数量、kernel time、临时张量 | P0 |
+| M23 | Fused RoPE | Python/PyTorch 实现 | TODO | kernel 数量和 HBM traffic | P1 |
+| M24 | Fused cross entropy | 标准 PyTorch CE | TODO | vocab-parallel CE 吞吐/峰值 | P0 |
+| M25 | Fused optimizer | torch AdamW + Python copies | TODO | optimizer step time、state memory | P0 |
+| M26 | FP8 / Transformer Engine | 无 | TODO | H100/A100 可用矩阵分别验收 | P2 |
+| M27 | CUDA Graph | 无 | TODO | steady-state launch overhead | P2 |
+| M28 | MoE router aux/z loss | 无 | TODO | loss 与梯度正确性 | P1 |
+| M29 | MoE capacity/drop policies | 无 | TODO | dispatch correctness 与负载 | P1 |
+| M30 | Grouped GEMM for experts | Python expert loop | TODO | expert kernel 数和吞吐 | P1 |
+| M31 | Distributed checkpoint | rank-0 torch save | PARTIAL | sharded save/load、并行重分片 | P1 |
+| M32 | Async checkpoint | 无 | TODO | checkpoint stall time | P2 |
+| M33 | Deterministic distributed RNG | 基础 seed，无 TP RNG tracker | PARTIAL | dropout/checkpoint 重算一致 | P1 |
+| M34 | Gradient accumulation | 支持 | DONE | no_sync/通信频率对齐 | P0 |
+| M35 | Gradient clipping/NaN detection | 部分策略支持 | PARTIAL | distributed norm 与 overflow 行为 | P1 |
+| M36 | 数据预处理/packed sequence | 普通 HF DataLoader | TODO | padding 浪费、loader 吞吐 | P1 |
+| M37 | MFU/通信/内存可观测性 | tok/s + peak allocated | PARTIAL | JSON、MFU、per-rank memory、NCCL trace | P0 |
+| M38 | Fault tolerance/straggler detection | 无 | TODO | 大规模训练前再纳入 | P2 |
+
+## 推进顺序
+
+1. `M01/M02/M20/M21/M22/M24/M25/M37`：先把单卡 Qwen3-0.6B 的计算图、指标和
+   kernel 基线做准，避免并行优化掩盖单卡问题。
+2. `M05/M06/M13/M14/M16`：对标 DP + distributed optimizer 的连续 buffer 和 overlap。
+3. `M03/M04/M12`：对标 TP + SP，逐层核对 collective 数量与 overlap。
+4. `M07/M08/M15`：实现 1F1B/VPP，再扩到组合并行。
+5. `M09/M10/M11/M28-M30`：长上下文和 MoE 独立矩阵。
+
+每完成一行，都要把代码 revision 和对应实验 ID 回填到本表，不能只把“能跑”标成
+`DONE`。
+
+## 当前基线
+
+单卡 `S0` 只保留为模型/kernel smoke test，不再用于判断 Megatron parity。正式基线从
+两卡分布式实验开始：
+
+| ID | 拓扑 | nano tok/s | Megatron tok/s | 速度比 | nano/Megatron 显存 | 当前结论 |
+|---|---|---:|---:|---:|---:|---|
+| D0 (旧实现) | DP2 + distributed optimizer | 3647.8 | 5818.2 | 0.627 | 1.147 | 两项均未达标 |
+| D1 (flat RS/AG) | DP2 + distributed optimizer | 4770.0 | 5812.2 | 0.821 | 1.328 | 速度提升明显，显存回退，仍未达标 |
+| D2* (fused projections/Adam) | DP2 + distributed optimizer | 4974.5 | 5813.2 | 0.856 | 1.272 | 单次探索，尚未正式验收 |
+| D3* (+ param AG overlap) | DP2 + distributed optimizer | 5020.1 | 5815.9 | 0.863 | 1.272 | 单次探索，尚未正式验收 |
+| T0 | TP2 | 4860.1 | 4562.5 | 1.067 | 1.062 | 速度达标，显存未达标 |
+
+以上均为 3 次独立运行的中位数。D0 定位出的整 bucket AllReduce、完整 parameter
+round-robin owner 和串行 Broadcast 已在 D1 实现中替换为 dtype 连续 buffer、均匀
+tensor shard、backward 异步 ReduceScatter 和 bucket AllGather。两 rank 的梯度累积及
+Adam 更新已通过 reference 对比。D1 三次运行的中位吞吐从 3647.8 提升到 4770.0
+tok/s（+30.8%），但仍只有 Megatron 的 82.1%；峰值显存从 13130 MiB 增至
+15204 MiB。下一步必须拆分 forward/backward、ReduceScatter、Adam 和 AllGather
+耗时，并核对 persistent grad/master-grad buffer 与激活保存量，不能把 D1 标为完成。
+
+D2/D3 进一步融合 QKV、SwiGLU gate/up 和 AdamW，并按 forward 顺序发起参数
+AllGather、由 module pre-hook 等待对应 bucket。单次吞吐分别达到 4974.5 和
+5020.1 tok/s；这是有方向性的改善，但按验收规则仍需三次独立运行才能替换 D1。
+
+## 参考口径
+
+- Megatron Core advanced features:
+  https://docs.nvidia.com/megatron-core/developer-guide/latest/user-guide/features/index.html
+- Megatron Core distributed optimizer:
+  https://docs.nvidia.com/megatron-core/developer-guide/latest/user-guide/features/dist_optimizer.html
+- Megatron-LM source: https://github.com/NVIDIA/Megatron-LM
+- Qwen3-0.6B config: https://huggingface.co/Qwen/Qwen3-0.6B/blob/main/config.json

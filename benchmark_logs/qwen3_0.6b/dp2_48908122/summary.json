@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "protocol": "D0-dp2-distributed-optimizer",
+  "nano": {
+    "tokens_per_second": 5020.131760906807,
+    "mean_step_ms": 407.95741975307465,
+    "peak_smi_mib": 14562.0,
+    "peak_allocated_gib": 13.119269847869873
+  },
+  "megatron": {
+    "tokens_per_second": 5815.868688589765,
+    "mean_step_ms": 352.14,
+    "peak_smi_mib": 11446.0
+  },
+  "parity": {
+    "throughput_ratio_nano_over_megatron": 0.8631783194754507,
+    "memory_ratio_nano_over_megatron": 1.2722348418661542
+  },
+  "megatron_measured_step_ms": [
+    352.3,
+    351.9,
+    352.0,
+    352.1,
+    352.1,
+    352.5,
+    352.1,
+    351.8,
+    352.5,
+    352.1
+  ]
+}

@@ -1,0 +1,29 @@
+# Canonical shape from Qwen/Qwen3-0.6B. Benchmarks use random tokens and weights.
+model:
+  name: "Qwen/Qwen3-0.6B"
+  hidden_size: 1024
+  num_layers: 28
+  num_heads: 16
+  num_kv_heads: 8
+  head_dim: 128
+  intermediate_size: 3072
+  vocab_size: 151936
+  max_seq_len: 40960
+  rms_norm_eps: 1.0e-6
+  rope_theta: 1000000.0
+  attention_backend: "math"
+
+benchmark:
+  seed: 1234
+  micro_batch_size: 1
+  global_batch_size: 1
+  seq_len: 1024
+  warmup_steps: 3
+  measure_steps: 10
+  dtype: "float16"
+  gradient_checkpointing: false
+  lr: 1.0e-4
+  weight_decay: 0.0
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  adam_eps: 1.0e-8

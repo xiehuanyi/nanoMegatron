@@ -1,0 +1,113 @@
+{
+  "schema_version": 1,
+  "protocol": "D0-dp2-distributed-optimizer",
+  "run_count": 3,
+  "source_summaries": [
+    "benchmark_logs/qwen3_0.6b/dist_48895927/summary.json",
+    "benchmark_logs/qwen3_0.6b/dp2_48896947/summary.json",
+    "benchmark_logs/qwen3_0.6b/dp2_48896948/summary.json"
+  ],
+  "median": {
+    "nano_tokens_per_second": 3647.8397105792974,
+    "megatron_tokens_per_second": 5818.181818181819,
+    "throughput_ratio_nano_over_megatron": 0.6269902619731536,
+    "nano_peak_smi_mib": 13130.0,
+    "megatron_peak_smi_mib": 11446.0,
+    "memory_ratio_nano_over_megatron": 1.1471256334090512
+  },
+  "runs": [
+    {
+      "schema_version": 1,
+      "protocol": "D0-dp2-distributed-optimizer",
+      "nano": {
+        "tokens_per_second": 3654.44884865372,
+        "mean_step_ms": 560.4128241539001,
+        "peak_smi_mib": 13130.0,
+        "peak_allocated_gib": 11.769662380218506
+      },
+      "megatron": {
+        "tokens_per_second": 5819.6698019379955,
+        "mean_step_ms": 351.91,
+        "peak_smi_mib": 11446.0
+      },
+      "parity": {
+        "throughput_ratio_nano_over_megatron": 0.6279477999656888,
+        "memory_ratio_nano_over_megatron": 1.1471256334090512
+      },
+      "megatron_measured_step_ms": [
+        352.1,
+        352.1,
+        351.9,
+        352.6,
+        351.8,
+        351.7,
+        351.9,
+        351.9,
+        351.6,
+        351.5
+      ]
+    },
+    {
+      "schema_version": 1,
+      "protocol": "D0-dp2-distributed-optimizer",
+      "nano": {
+        "tokens_per_second": 3645.923348419429,
+        "mean_step_ms": 561.7232739925385,
+        "peak_smi_mib": 13130.0,
+        "peak_allocated_gib": 11.769662380218506
+      },
+      "megatron": {
+        "tokens_per_second": 5818.181818181819,
+        "mean_step_ms": 352.0,
+        "peak_smi_mib": 11446.0
+      },
+      "parity": {
+        "throughput_ratio_nano_over_megatron": 0.6266430755095893,
+        "memory_ratio_nano_over_megatron": 1.1471256334090512
+      },
+      "megatron_measured_step_ms": [
+        352.6,
+        351.8,
+        351.8,
+        352.3,
+        351.7,
+        351.9,
+        352.0,
+        352.0,
+        351.8,
+        352.1
+      ]
+    },
+    {
+      "schema_version": 1,
+      "protocol": "D0-dp2-distributed-optimizer",
+      "nano": {
+        "tokens_per_second": 3647.8397105792974,
+        "mean_step_ms": 561.42817735672,
+        "peak_smi_mib": 13130.0,
+        "peak_allocated_gib": 11.769662380218506
+      },
+      "megatron": {
+        "tokens_per_second": 5818.016533621204,
+        "mean_step_ms": 352.01,
+        "peak_smi_mib": 11446.0
+      },
+      "parity": {
+        "throughput_ratio_nano_over_megatron": 0.6269902619731536,
+        "memory_ratio_nano_over_megatron": 1.1471256334090512
+      },
+      "megatron_measured_step_ms": [
+        352.0,
+        351.8,
+        352.2,
+        352.8,
+        352.1,
+        352.2,
+        351.7,
+        351.7,
+        351.8,
+        351.8
+      ]
+    }
+  ]
+}
