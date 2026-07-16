@@ -67,9 +67,9 @@ and at most 105% peak HBM under the same topology.
 | D1 | 4770.0 | 5812.2 | 0.821 | 1.328 | dtype-flat buffers, balanced tensor shards, backward ReduceScatter, bucket AllGather |
 | D2* | 4974.5 | 5813.2 | 0.856 | 1.272 | fused QKV and SwiGLU input GEMMs, fused AdamW |
 | D3* | 5020.1 | 5815.9 | 0.863 | 1.272 | launch AllGather in forward order and wait from module pre-hooks |
-| D4 (running) | - | - | - | - | Megatron-style math attention, RMSNorm/RoPE/CE alignment, exact bucket packing |
+| D4* | 8428.3 | 7610.8 | 1.107 | 1.017 | Megatron-style math attention, RMSNorm/RoPE/CE alignment, exact bucket packing |
 
-`D0` and `D1` are three-job medians. `D2` and `D3` are one-job exploratory
+`D0` and `D1` are three-job medians. `D2`, `D3`, and `D4` are one-job exploratory
 runs and are not promoted to formal results yet. Raw summaries and the exact
 protocol live in `benchmark_logs/qwen3_0.6b/`; the maintained feature and
 acceptance matrix is in `docs/MEGATRON_PARITY.md`.
@@ -99,6 +99,10 @@ What the attempts taught us:
    parameter AllGather waits use Python `Work.wait()`, and there is no Megatron
    multi-tensor optimizer/overflow infrastructure. Activation checkpointing is
    not counted as a fix while the Megatron side has recomputation disabled.
+7. The first D4 run passes both parity thresholds on a 2× V100 SXM2 node:
+   110.7% of Megatron throughput and 101.7% of its sampled peak HBM. Steady-state
+   step-time CV is 0.16%. Two more independent jobs are required before this is
+   promoted from an exploratory result.
 
 Jobs: D1 `48899170`, `48901884`, `48901885`; D2 `48908022`; D3 `48908122`;
 D4 `48977678` (`48975002` was cancelled before start to remove the debug partition pin).

@@ -25,7 +25,7 @@ case "$BENCHMARK_MODE" in
         GLOBAL_BATCH=2
         TP_SIZE=1
         GLOBAL_TOKENS=2048
-        PROTOCOL=D0-dp2-distributed-optimizer
+        PROTOCOL=D4-dp2-compute-graph-parity
         MCORE_PARALLEL_ARGS=(--use-distributed-optimizer --overlap-grad-reduce --overlap-param-gather)
         ;;
     tp2)

@@ -83,7 +83,7 @@ attention backend 下，让 nanoMegatron 达到 Megatron Core 的训练吞吐和
 | D1 (flat RS/AG) | DP2 + distributed optimizer | 4770.0 | 5812.2 | 0.821 | 1.328 | 速度提升明显，显存回退，仍未达标 |
 | D2* (fused projections/Adam) | DP2 + distributed optimizer | 4974.5 | 5813.2 | 0.856 | 1.272 | 单次探索，尚未正式验收 |
 | D3* (+ param AG overlap) | DP2 + distributed optimizer | 5020.1 | 5815.9 | 0.863 | 1.272 | 单次探索，尚未正式验收 |
-| D4 (compute graph parity) | DP2 + distributed optimizer | 运行中 | 运行中 | - | - | job `48977678` |
+| D4* (compute graph parity) | DP2 + distributed optimizer | 8428.3 | 7610.8 | 1.107 | 1.017 | 单次运行两项达标，待三次中位数 |
 | T0 | TP2 | 4860.1 | 4562.5 | 1.067 | 1.062 | 速度达标，显存未达标 |
 
 以上均为 3 次独立运行的中位数。D0 定位出的整 bucket AllReduce、完整 parameter
@@ -110,6 +110,12 @@ model-dtype 到 FP32 main-grad copy、overflow/norm 和 optimizer 调度尚未�
 AllGather 的依赖由 Python `Work.wait()` 驱动，而非完整的 stream/event 调度。D4
 结果出来后，下一轮优先用分阶段 CUDA timing 判断瓶颈在 attention backward、grad
 copy/norm、Adam 还是 param gather，避免继续凭感觉改动。
+
+D4 首次运行 `48977678` 位于 2× V100-SXM2 NVLink 节点。nano 稳态为
+`242.99 ms/step`、`8428.3 tok/s`、SMI 峰值 `11710 MiB`；Megatron 为
+`269.09 ms/step`、`7610.8 tok/s`、SMI 峰值 `11518 MiB`。速度比 `1.107`，显存比
+`1.017`，均通过目标；nano step-time CV 为 `0.16%`。由于这是单次运行，仍需两个
+独立作业后取三次中位数，才能标为正式达标。
 
 ## 参考口径
 
