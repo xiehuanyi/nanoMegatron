@@ -68,6 +68,7 @@ and at most 105% peak HBM under the same topology.
 | D2* | 4974.5 | 5813.2 | 0.856 | 1.272 | fused QKV and SwiGLU input GEMMs, fused AdamW |
 | D3* | 5020.1 | 5815.9 | 0.863 | 1.272 | launch AllGather in forward order and wait from module pre-hooks |
 | D4 | 8435.2 | 7610.8 | 1.108 | 1.017 | Megatron-style math attention, RMSNorm/RoPE/CE alignment, exact bucket packing |
+| D5 | 8437.2 | 7729.2 | 1.092 | 1.017 | rank-local input tokens are identical and fixed in both engines |
 
 `D0`, `D1`, and `D4` are three-job medians. `D2` and `D3` are one-job exploratory
 runs and are not promoted to formal results. Raw summaries and the exact
@@ -110,10 +111,24 @@ What the attempts taught us:
    FP32 logits/loss are exact and all gradient cosines are at least 0.99999988.
    In FP16, max logit difference is 9.77e-4, loss difference is 6.48e-5, max
    gradient difference is 2.44e-4, and minimum gradient cosine is 0.99999905.
+9. D4 still reused one random batch in nano while Megatron advanced its mock
+   dataloader. D5 removes that mismatch: both engines now generate the same
+   rank-local token tensor once and reuse it. Three-run median advantage remains
+   9.2%, so changing batches was not the explanation. Rank-0 input sum and the
+   first eight token IDs are emitted by both engines and match exactly.
+10. PyTorch profiling locates the advantage. Across three profiled steps,
+    Megatron executes 763 more CUDA launches per step and 29.9 ms more aggregate
+    CUDA kernel time per step. The largest component is optimizer execution:
+    Megatron's local fallback multi-tensor Adam takes 28.7 ms for the inner step,
+    while nano uses fused `torch.optim.AdamW`. The remaining overhead comes from
+    generic TP-capable linear wrappers, FP32 main-grad checks/scaling, extra
+    pointwise/cat/copy kernels, and repeated RoPE cos/sin application. Large GEMM
+    runtimes are nearly identical.
 
 Jobs: D1 `48899170`, `48901884`, `48901885`; D2 `48908022`; D3 `48908122`;
-D4 `48977678`, `48979015`, `48979016`. Correctness: FP32 `48980002`, FP16
-`48980005`.
+D4 `48977678`, `48979015`, `48979016`; D5 `48980514`, `48980551`,
+`48980552`; profiling `48980515`.
+Correctness: FP32 `48980002`, FP16 `48980005`.
 
 Two head-to-head runs on Ibex, full 3.8B Phi-tiny-MoE (32 layers, 16 experts top-2), `seq_len=96`, `batch_size=1`, `grad_accum=1`, gradient checkpointing on, fp16, 10 steps. nanoMegatron, DeepSpeed 0.18.9, PyTorch FSDP all run on the same checkpoint with the same script (`scripts/run_v100_benchmark.sh` / `scripts/run_4gpu_benchmarks.sh`).
 

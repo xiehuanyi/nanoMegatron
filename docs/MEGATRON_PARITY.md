@@ -84,6 +84,7 @@ attention backend 下，让 nanoMegatron 达到 Megatron Core 的训练吞吐和
 | D2* (fused projections/Adam) | DP2 + distributed optimizer | 4974.5 | 5813.2 | 0.856 | 1.272 | 单次探索，尚未正式验收 |
 | D3* (+ param AG overlap) | DP2 + distributed optimizer | 5020.1 | 5815.9 | 0.863 | 1.272 | 单次探索，尚未正式验收 |
 | D4 (compute graph parity) | DP2 + distributed optimizer | 8435.2 | 7610.8 | 1.108 | 1.017 | 三次中位数，速度和显存均达标 |
+| D5 (identical fixed input) | DP2 + distributed optimizer | 8437.2 | 7729.2 | 1.092 | 1.017 | 三次中位数，消除输入行为差异后仍达标 |
 | T0 | TP2 | 4860.1 | 4562.5 | 1.067 | 1.062 | 速度达标，显存未达标 |
 
 以上均为 3 次独立运行的中位数。D0 定位出的整 bucket AllReduce、完整 parameter
@@ -123,6 +124,27 @@ Megatron GQA group layout。FP32 job `48980002` 的 logits/loss 完全一致，�
 gradient 最大绝对误差 `3.73e-8`、最小 cosine `0.99999988`。FP16 job `48980005`
 的 loss 绝对误差 `6.48e-5`、logits 最大绝对误差 `9.77e-4`、gradient 最大绝对误差
 `2.44e-4`、最小 cosine `0.99999905`，符合 FP16 舍入预期。
+
+D4 的 nano 复用固定随机 batch，而 Megatron 每步推进 mock dataloader。D5 使用共同
+的 rank-local CUDA generator，使两边生成并复用完全相同的 token/label tensor。隔离
+三次运行 `48980514/48980551/48980552` 后，中位数为 nano
+`8437.2 tok/s`、Megatron `7729.2 tok/s`，速度比 `1.092`，说明数据变化不是主要
+原因。两边日志记录的 rank-0 token sum 均为 `77806310`，前八个 token 均为
+`[144072, 109224, 139223, 44068, 82536, 147356, 12291, 89204]`，输入已逐值核对。
+
+profiling job `48980515` 同时启用 Megatron timers 和两边的 PyTorch CUDA profiler。
+三个 active steps 中，nano/Megatron 的累计 CUDA kernel time 为 `808.2/898.0 ms`；
+Megatron 每步多 `763` 个 CUDA launch，多约 `29.9 ms` aggregate kernel time。
+主要来源如下：
+
+1. Megatron 当前环境没有 Apex/TE optimizer extension，fallback Adam inner step 为
+   `28.7 ms`；nano 使用 fused `torch.optim.AdamW`，这是最大的单项差异。
+2. Megatron 的通用 TP-capable linear/main-grad 路径增加 unscale、finite check、
+   foreach update、norm、cat/copy 等 kernel。
+3. Megatron 每步额外承担约 763 个小 kernel launch；三个 step 的
+   `cudaLaunchKernel` CPU 时间比 nano 多 `24.7 ms`。
+4. 两边主要 FP16 GEMM kernel 时间接近，因此优势不是少算 layer、hidden size 或
+   token，而是 optimizer 和通用框架小 kernel/launch 开销。
 
 ## 参考口径
 

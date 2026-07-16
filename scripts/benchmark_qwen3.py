@@ -47,6 +47,9 @@ def main():
     parser.add_argument("--measure-steps", type=int)
     parser.add_argument("--seq-len", type=int)
     parser.add_argument("--cross-step-overlap", action="store_true")
+    parser.add_argument("--profile-output")
+    parser.add_argument("--profile-step-start", type=int, default=10)
+    parser.add_argument("--profile-step-end", type=int, default=13)
     parser.add_argument("--strategy", choices=("none", "ddp", "zero2", "tp"), default="none")
     args = parser.parse_args()
 
@@ -118,6 +121,25 @@ def main():
     grad_norms = []
     timing_events = []
     total_steps = warmup_steps + measure_steps
+    profiler = None
+    if args.profile_output and rank == 0:
+        profile_path = Path(args.profile_output)
+        profile_path.parent.mkdir(parents=True, exist_ok=True)
+        profiler = torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            schedule=torch.profiler.schedule(
+                wait=max(args.profile_step_start - 1, 0),
+                warmup=1 if args.profile_step_start > 0 else 0,
+                active=args.profile_step_end - args.profile_step_start,
+                repeat=1,
+            ),
+            on_trace_ready=lambda prof: prof.export_chrome_trace(str(profile_path)),
+            record_shapes=True,
+        )
+        profiler.start()
     if distributed:
         dist.barrier()
     torch.cuda.synchronize()
@@ -131,21 +153,27 @@ def main():
         else:
             torch.cuda.synchronize()
             start = time.perf_counter()
-        optimizer.zero_grad()
-        output = model(
-            tokens,
-            labels=labels,
-            return_logits=False,
-            labels_shifted=True,
-        )
-        output["loss"].backward()
+        with torch.profiler.record_function("nano::zero_grad"):
+            optimizer.zero_grad()
+        with torch.profiler.record_function("nano::forward"):
+            output = model(
+                tokens,
+                labels=labels,
+                return_logits=False,
+                labels_shifted=True,
+            )
+        with torch.profiler.record_function("nano::backward"):
+            output["loss"].backward()
         if args.strategy == "tp":
             from nano_megatron.parallel.qwen3_tensor_parallel import sync_replicated_grads
 
-            sync_replicated_grads(model)
+            with torch.profiler.record_function("nano::tp_grad_sync"):
+                sync_replicated_grads(model)
         if args.strategy == "zero2":
-            grad_norms.append(optimizer.grad_norm())
-        optimizer.step()
+            with torch.profiler.record_function("nano::grad_sync_copy_norm"):
+                grad_norms.append(optimizer.grad_norm())
+        with torch.profiler.record_function("nano::optimizer_step_param_gather"):
+            optimizer.step()
         if args.cross_step_overlap:
             end_event.record()
             timing_events.append((start_event, end_event))
@@ -176,9 +204,13 @@ def main():
                 ),
                 flush=True,
             )
+        if profiler is not None:
+            profiler.step()
 
     if args.strategy == "zero2":
         optimizer.finish_param_sync()
+    if profiler is not None:
+        profiler.stop()
     torch.cuda.synchronize()
     if args.cross_step_overlap:
         for step, (start_event, end_event) in enumerate(timing_events):
@@ -231,6 +263,9 @@ def main():
         "warmup_steps": warmup_steps,
         "measure_steps": measure_steps,
         "gradient_checkpointing": bench.gradient_checkpointing,
+        "input_protocol": "rank-local fixed tokens, shared generator with Megatron",
+        "rank0_input_sum": token_stream.sum().item() if rank == 0 else None,
+        "rank0_input_prefix": token_stream[0, :8].tolist() if rank == 0 else None,
         "cross_step_overlap": args.cross_step_overlap,
         "mean_step_ms": mean_seconds * 1000,
         "median_step_ms": statistics.median(durations) * 1000,

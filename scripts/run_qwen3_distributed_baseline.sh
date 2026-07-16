@@ -25,7 +25,7 @@ case "$BENCHMARK_MODE" in
         GLOBAL_BATCH=2
         TP_SIZE=1
         GLOBAL_TOKENS=2048
-        PROTOCOL=D4-dp2-compute-graph-parity
+        PROTOCOL=D5-dp2-identical-fixed-input
         MCORE_PARALLEL_ARGS=(--use-distributed-optimizer --overlap-grad-reduce --overlap-param-gather)
         ;;
     tp2)
@@ -46,6 +46,31 @@ OUT_DIR=${OUT_DIR:-benchmark_logs/qwen3_0.6b/${BENCHMARK_MODE}_${SLURM_JOB_ID:-l
 NANO_EXTRA_ARGS=()
 if [[ ${CROSS_STEP_OVERLAP:-0} == 1 ]]; then
     NANO_EXTRA_ARGS+=(--cross-step-overlap)
+fi
+MCORE_TRAIN_ITERS=13
+MCORE_LOG_INTERVAL=1
+MCORE_PROFILE_ARGS=()
+if [[ ${PROFILE:-0} == 1 ]]; then
+    NANO_EXTRA_ARGS+=(
+        --warmup-steps 10
+        --measure-steps 5
+        --profile-output "$OUT_DIR/nano_trace.json"
+        --profile-step-start 10
+        --profile-step-end 13
+    )
+    MCORE_TRAIN_ITERS=15
+    MCORE_LOG_INTERVAL=5
+    MCORE_PROFILE_ARGS=(
+        --timing-log-level 2
+        --timing-log-option minmax
+        --no-barrier-with-level-1-timing
+        --profile
+        --use-pytorch-profiler
+        --profile-step-start 10
+        --profile-step-end 13
+        --profile-ranks 0
+        --tensorboard-dir "$REPO_DIR/$OUT_DIR/megatron_profile"
+    )
 fi
 
 cd "$REPO_DIR"
@@ -98,7 +123,8 @@ run_sampled "$OUT_DIR/nano_memory.csv" \
 
 cd "$MEGATRON_LM_DIR"
 run_sampled "$REPO_DIR/$OUT_DIR/megatron_memory.csv" \
-    "$TORCHRUN" --standalone --nproc_per_node=2 pretrain_gpt.py \
+    "$TORCHRUN" --standalone --nproc_per_node=2 \
+    "$REPO_DIR/scripts/benchmark_megatron_qwen3.py" \
     --use-mcore-models \
     --transformer-impl local \
     --attention-backend unfused \
@@ -128,8 +154,8 @@ run_sampled "$REPO_DIR/$OUT_DIR/megatron_memory.csv" \
     --no-bias-swiglu-fusion \
     --micro-batch-size 1 \
     --global-batch-size "$GLOBAL_BATCH" \
-    --train-iters 13 \
-    --lr-decay-iters 13 \
+    --train-iters "$MCORE_TRAIN_ITERS" \
+    --lr-decay-iters "$MCORE_TRAIN_ITERS" \
     --lr 1e-4 \
     --min-lr 1e-4 \
     --weight-decay 0.0 \
@@ -148,7 +174,8 @@ run_sampled "$REPO_DIR/$OUT_DIR/megatron_memory.csv" \
     --make-vocab-size-divisible-by 1187 \
     --data-cache-path "$REPO_DIR/$OUT_DIR/mcore_cache" \
     --num-workers 1 \
-    --log-interval 1 \
+    --log-interval "$MCORE_LOG_INTERVAL" \
+    "${MCORE_PROFILE_ARGS[@]}" \
     --eval-iters 0 \
     --eval-interval 1000 \
     --no-create-attention-mask-in-dataloader \
@@ -156,5 +183,7 @@ run_sampled "$REPO_DIR/$OUT_DIR/megatron_memory.csv" \
     2>&1 | tee "$REPO_DIR/$OUT_DIR/megatron.log"
 
 cd "$REPO_DIR"
-"$PYTHON" scripts/summarize_qwen3_baseline.py "$OUT_DIR" \
-    --global-tokens-per-step "$GLOBAL_TOKENS" --protocol "$PROTOCOL"
+if [[ ${PROFILE:-0} != 1 ]]; then
+    "$PYTHON" scripts/summarize_qwen3_baseline.py "$OUT_DIR" \
+        --global-tokens-per-step "$GLOBAL_TOKENS" --protocol "$PROTOCOL"
+fi
