@@ -4,7 +4,6 @@
 #SBATCH --job-name=qwen3-dist
 #SBATCH --output=benchmark_logs/qwen3_0.6b/slurm_dist_%j.out
 #SBATCH --error=benchmark_logs/qwen3_0.6b/slurm_dist_%j.err
-#SBATCH --partition=debug
 #SBATCH --gres=gpu:v100:2
 #SBATCH --cpus-per-task=12
 #SBATCH --mem=96G

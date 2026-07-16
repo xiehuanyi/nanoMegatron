@@ -41,7 +41,7 @@ attention backend 下，让 nanoMegatron 达到 Megatron Core 的训练吞吐和
 | M18 | Selective recomputation | 无 | TODO | core-attn selective recompute | P1 |
 | M19 | Activation CPU offload | 无 | TODO | 异步 D2H/H2D overlap | P2 |
 | M20 | Attention backend | D4 对齐 local/unfused `baddbmm-softmax-bmm`；另有 SDPA | PARTIAL | A100/H100 再对标 TE/FlashAttention | P0 |
-| M21 | RMSNorm | D4 使用 `torch.nn.RMSNorm`，与当前 Megatron local path 一致 | DONE | D4 `48975002` | P0 |
+| M21 | RMSNorm | D4 使用 `torch.nn.RMSNorm`，与当前 Megatron local path 一致 | DONE | D4 `48977678` | P0 |
 | M22 | Fused QKV/MLP GEMM | fused QKV 和 gate/up projection | DONE | D2 `48908022` | P0 |
 | M23 | Fused RoPE | D4 缓存 cos/sin，仍是 PyTorch pointwise graph | PARTIAL | kernel 数量和 HBM traffic | P1 |
 | M24 | Cross entropy | D4 custom autograd，FP32 in-place softmax，不保留返回 logits | PARTIAL | DP 已对齐，TP vocab-parallel backward 继续核对 | P0 |
@@ -83,7 +83,7 @@ attention backend 下，让 nanoMegatron 达到 Megatron Core 的训练吞吐和
 | D1 (flat RS/AG) | DP2 + distributed optimizer | 4770.0 | 5812.2 | 0.821 | 1.328 | 速度提升明显，显存回退，仍未达标 |
 | D2* (fused projections/Adam) | DP2 + distributed optimizer | 4974.5 | 5813.2 | 0.856 | 1.272 | 单次探索，尚未正式验收 |
 | D3* (+ param AG overlap) | DP2 + distributed optimizer | 5020.1 | 5815.9 | 0.863 | 1.272 | 单次探索，尚未正式验收 |
-| D4 (compute graph parity) | DP2 + distributed optimizer | 运行中 | 运行中 | - | - | job `48975002` |
+| D4 (compute graph parity) | DP2 + distributed optimizer | 运行中 | 运行中 | - | - | job `48977678` |
 | T0 | TP2 | 4860.1 | 4562.5 | 1.067 | 1.062 | 速度达标，显存未达标 |
 
 以上均为 3 次独立运行的中位数。D0 定位出的整 bucket AllReduce、完整 parameter

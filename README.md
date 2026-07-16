@@ -101,7 +101,7 @@ What the attempts taught us:
    not counted as a fix while the Megatron side has recomputation disabled.
 
 Jobs: D1 `48899170`, `48901884`, `48901885`; D2 `48908022`; D3 `48908122`;
-D4 `48975002`.
+D4 `48977678` (`48975002` was cancelled before start to remove the debug partition pin).
 
 Two head-to-head runs on Ibex, full 3.8B Phi-tiny-MoE (32 layers, 16 experts top-2), `seq_len=96`, `batch_size=1`, `grad_accum=1`, gradient checkpointing on, fp16, 10 steps. nanoMegatron, DeepSpeed 0.18.9, PyTorch FSDP all run on the same checkpoint with the same script (`scripts/run_v100_benchmark.sh` / `scripts/run_4gpu_benchmarks.sh`).
 
