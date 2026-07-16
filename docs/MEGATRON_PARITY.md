@@ -29,7 +29,7 @@ attention backend 下，让 nanoMegatron 达到 Megatron Core 的训练吞吐和
 | M06 | Distributed Optimizer | dtype flat buffer + 等长 tensor shard + RS/AG | PARTIAL | D6 三次运行验收 | P0 |
 | M07 | Pipeline Parallel | GPipe | PARTIAL | 1F1B、bubble、P2P overlap | P1 |
 | M08 | Interleaved/virtual PP | 无 | TODO | VPP schedule 与 bubble | P1 |
-| M09 | Context Parallel | 无 | TODO | 长序列 ring P2P/all-gather 路径 | P1 |
+| M09 | Context Parallel | Qwen3 zigzag 分片、同步 K/V AllGather、反向 ReduceScatter、全局 loss/权重梯度归约 | PARTIAL | CP2 numerics/显存/吞吐；后续 ring P2P overlap 和 TP/PP/DP 组合 | P1 |
 | M10 | Expert Parallel | AllToAll dispatch | PARTIAL | token permutation、grouped GEMM、负载均衡 | P1 |
 | M11 | Expert Tensor Parallel | 无独立 ETP | TODO | EP/ETP folding 拓扑 | P2 |
 | M12 | TP 通信计算重叠 | 同步 collective | TODO | `tp-comm-overlap` 同级隐藏率 | P0 |
@@ -68,6 +68,42 @@ attention backend 下，让 nanoMegatron 达到 Megatron Core 的训练吞吐和
 3. `M03/M04/M12`：对标 TP + SP，逐层核对 collective 数量与 overlap。
 4. `M07/M08/M15`：实现 1F1B/VPP，再扩到组合并行。
 5. `M09/M10/M11/M28-M30`：长上下文和 MoE 独立矩阵。
+
+## M09 Context Parallel 实验设计
+
+- `CP-C0` 正确性：2 卡、tiny Qwen3、FP32，逐 rank 对比本地 logits，并对比全局
+  loss 和 CP 权重梯度 AllReduce 后的完整模型梯度。
+- `CP-B0` 冒烟与显存：2×V100、Qwen3-0.6B、FP16、global sequence 2048、
+  micro batch 1；记录 tok/s、allocated/reserved 和逐卡 `nvidia-smi`。
+- `CP-B1` 同口径对标：nano 与 Megatron 都使用 CP=2 和同步 `all_gather` 通信，
+  固定模型、tokens、optimizer、attention backend，再比较速度和显存。
+- `CP-P0` profiling：统计每层两次 K/V AllGather、反向 ReduceScatter、权重梯度
+  AllReduce 的时间和暴露比例，确认下一步应优先做 ring P2P 还是 grad overlap。
+
+当前实现只覆盖 dense Qwen3 的纯 CP 组。没有 ring P2P/overlap、`a2a`、层级 CP、
+packed sequence，也没有与 TP/PP/DP/distributed optimizer 的 process-group 组合，
+因此状态保持 `PARTIAL`。
+
+首轮探索结果（2×V100，seq=2048，单次作业）：
+
+| 实验 | 拓扑 | tok/s | 每卡 peak allocated | 结论 |
+|---|---|---:|---:|---|
+| CP-S0 `48986931` | 单卡、完整序列 | 4447.5 | 17.65 GiB | 对照组 |
+| CP-B0 `48986133` | CP2、zigzag + 同步 AllGather | 5575.8 | 12.99 GiB | +25.4% 吞吐，-26.4% 每卡显存 |
+
+`CP-C0` logits/loss/梯度检查已在 CPU/Gloo 和 2×V100/NCCL 通过：FP32 +
+activation recomputation job `48987179`，FP16 + activation recomputation job
+`48987328`。FP16 metrics 复跑 `48987960`：max logit diff `0`、loss diff
+`4.77e-7`、max grad diff `2.44e-4`、min grad cosine `0.9999995232`。
+
+`CP-P0` profile job `48987975` 的 trace 覆盖 6 个 step：每 step 有 56 次 K/V
+AllGather、56 次反向 ReduceScatter 和约 32 次权重梯度 AllReduce。NCCL kernel
+时间折算约为 K/V AllGather `4.18 ms/step`、K/V ReduceScatter `4.70 ms/step`、
+权重梯度 AllReduce `31.41 ms/step`。所以 seq=2048 下下一步先做梯度 bucket
+overlap 的收益可能大于只替换 ring attention 通信。
+
+上述性能数据还没有 Megatron CP2 对照，也没有三次独立运行，所以不能用于把 M09
+标成 `DONE`。
 
 每完成一行，都要把代码 revision 和对应实验 ID 回填到本表，不能只把“能跑”标成
 `DONE`。

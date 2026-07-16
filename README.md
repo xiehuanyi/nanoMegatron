@@ -59,7 +59,7 @@ in [`docs/MEGATRON_PARITY.md`](docs/MEGATRON_PARITY.md).
 | Sequence parallel | Sequence-dimension activation sharding | PARTIAL | Stub/limited paths only |
 | Pipeline parallel | GPipe and 1F1B schedules | PARTIAL | GPipe exists; 1F1B, interleaving, and communication overlap are missing |
 | Virtual pipeline | Interleaved pipeline stages | TODO | No virtual pipeline schedule |
-| Context parallel | Long-sequence context sharding | TODO | No context-parallel attention path |
+| Context parallel | Long-sequence context sharding | PARTIAL | Qwen3 has zigzag sequence shards plus synchronous K/V AllGather and backward ReduceScatter; ring overlap and TP/PP/DP composition are missing |
 | Expert parallel | MoE AllToAll dispatch | PARTIAL | Dispatch works; production token permutation and grouped GEMM are not aligned |
 | Expert tensor parallel | Independent ETP dimension | TODO | No ETP topology |
 | Recomputation | Full and selective activation recompute | PARTIAL | Whole-layer checkpointing exists; selective core-attention recompute is missing |
@@ -191,6 +191,48 @@ D4 `48977678`, `48979015`, `48979016`; D5 `48980514`, `48980551`,
 `48980552`; D6 `48981508`, `48981561`, `48981562`; profiling D5 `48980515`,
 profiling D6 `48981563`.
 Correctness: FP32 `48980002`, FP16 `48980005`, TE optimizer `48981695`.
+
+### Context parallel status
+
+The first Qwen3 context-parallel path is intentionally a correctness-first
+implementation of Megatron's synchronous `all_gather` CP mode:
+
+1. The global sequence is divided into `2 * CP` chunks. Rank `r` owns chunk
+   `r` and its mirrored chunk from the end, which balances causal-attention
+   work better than contiguous one-sided shards.
+2. Every layer keeps Q local and AllGathers K/V before attention. The custom
+   autograd function performs a ReduceScatter in backward so local K/V
+   activations receive gradients from every query shard.
+3. Causal masks use the original token positions because rank-major gathered
+   K/V order is intentionally not monotonic. Loss sums and replicated weight
+   gradients are reduced across the CP group.
+
+Run the two-rank path with:
+
+```bash
+torchrun --standalone --nproc_per_node=2 scripts/benchmark_qwen3.py \
+    --strategy cp --seq-len 2048 \
+    --output benchmark_logs/qwen3_0.6b/cp2.json
+```
+
+This row is `PARTIAL`, not `DONE`: Qwen3 numerics and a two-rank smoke test are
+the first acceptance gate, but nano still lacks Megatron/Transformer Engine's
+ring P2P overlap, `a2a` and hierarchical CP modes, packed-sequence handling,
+and CP composition with TP, PP, DP, and distributed optimizer groups.
+
+FP32 and FP16 local-logit/global-loss/gradient checks, including activation
+recomputation, pass on 2×V100 (jobs `48987179` and `48987328`). The first V100
+smoke run (`CP-B0`, job `48986133`) used sequence length 2048.
+Against the same one-GPU nano graph (job `48986931`), CP2 improved throughput
+from 4447.5 to 5575.8 tok/s and reduced peak allocated memory per GPU from
+17.65 to 12.99 GiB. These are single-job implementation checks, not yet a
+Megatron parity claim.
+
+The CP profile (`48987975`) shows why `PARTIAL` still matters: synchronous K/V
+AllGather plus backward ReduceScatter cost about 8.9 ms/step, while the
+post-backward replicated-weight AllReduce costs about 31.4 ms/step. At this
+sequence length, overlapping/bucketing weight-gradient reduction is a larger
+next win than replacing the K/V path alone.
 
 Two head-to-head runs on Ibex, full 3.8B Phi-tiny-MoE (32 layers, 16 experts top-2), `seq_len=96`, `batch_size=1`, `grad_accum=1`, gradient checkpointing on, fp16, 10 steps. nanoMegatron, DeepSpeed 0.18.9, PyTorch FSDP all run on the same checkpoint with the same script (`scripts/run_v100_benchmark.sh` / `scripts/run_4gpu_benchmarks.sh`).
 

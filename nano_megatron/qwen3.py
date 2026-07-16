@@ -5,6 +5,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 
 class Qwen3RMSNorm(nn.RMSNorm):
@@ -96,7 +97,9 @@ def _megatron_math_attention(
 
 class _CausalCrossEntropy(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, logits: torch.Tensor, targets: torch.Tensor):
+    def forward(ctx, logits: torch.Tensor, targets: torch.Tensor, reduction: str):
+        if reduction not in ("mean", "sum"):
+            raise ValueError(f"unsupported cross entropy reduction: {reduction}")
         original_dtype = logits.dtype
         probabilities = logits.float()
         if probabilities.data_ptr() == logits.data_ptr():
@@ -111,11 +114,13 @@ class _CausalCrossEntropy(torch.autograd.Function):
         ).squeeze(-1)
         flat_probabilities.exp_()
         sum_exp = flat_probabilities.sum(dim=-1)
-        loss = (sum_exp.log() - target_logits).mean()
+        losses = sum_exp.log() - target_logits
+        loss = losses.mean() if reduction == "mean" else losses.sum()
         flat_probabilities.div_(sum_exp.unsqueeze(-1))
 
         ctx.save_for_backward(probabilities, flat_targets)
         ctx.original_dtype = original_dtype
+        ctx.reduction = reduction
         return loss
 
     @staticmethod
@@ -124,12 +129,17 @@ class _CausalCrossEntropy(torch.autograd.Function):
         grad_logits = probabilities.view(-1, probabilities.shape[-1])
         rows = torch.arange(flat_targets.numel(), device=flat_targets.device)
         grad_logits[rows, flat_targets] -= 1.0
-        grad_logits.mul_(grad_output / flat_targets.numel())
-        return probabilities.to(ctx.original_dtype), None
+        divisor = flat_targets.numel() if ctx.reduction == "mean" else 1
+        grad_logits.mul_(grad_output / divisor)
+        return probabilities.to(ctx.original_dtype), None, None
 
 
-def causal_cross_entropy(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-    return _CausalCrossEntropy.apply(logits, targets)
+def causal_cross_entropy(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    reduction: str = "mean",
+) -> torch.Tensor:
+    return _CausalCrossEntropy.apply(logits, targets, reduction)
 
 
 class Qwen3Attention(nn.Module):
@@ -152,7 +162,15 @@ class Qwen3Attention(nn.Module):
         self.q_norm = Qwen3RMSNorm(self.head_dim, config.rms_norm_eps)
         self.k_norm = Qwen3RMSNorm(self.head_dim, config.rms_norm_eps)
 
-    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        position_ids: torch.Tensor = None,
+        gathered_position_ids: torch.Tensor = None,
+        cp_group=None,
+    ) -> torch.Tensor:
         batch, seq_len, _ = x.shape
         if hasattr(self, "qkv_proj"):
             q_size = self.num_heads * self.head_dim
@@ -171,17 +189,37 @@ class Qwen3Attention(nn.Module):
         v = v.transpose(1, 2)
         q = _apply_rope(q, cos, sin)
         k = _apply_rope(k, cos, sin)
-        k = k.repeat_interleave(self.num_kv_groups, dim=1)
-        v = v.repeat_interleave(self.num_kv_groups, dim=1)
+        if cp_group is not None:
+            from nano_megatron.parallel.context_parallel import (
+                context_parallel_attention,
+            )
 
-        if self.attention_backend == "megatron_math":
+            # Gather before expanding GQA heads to keep communication volume at
+            # num_kv_heads rather than num_heads.
+            out = context_parallel_attention(
+                q,
+                k,
+                v,
+                position_ids,
+                gathered_position_ids,
+                group=cp_group,
+                backend=self.attention_backend,
+                num_kv_groups=self.num_kv_groups,
+            )
+        elif self.attention_backend == "megatron_math":
+            k = k.repeat_interleave(self.num_kv_groups, dim=1)
+            v = v.repeat_interleave(self.num_kv_groups, dim=1)
             out = _megatron_math_attention(q, k, v)
         elif self.attention_backend == "math":
+            k = k.repeat_interleave(self.num_kv_groups, dim=1)
+            v = v.repeat_interleave(self.num_kv_groups, dim=1)
             from torch.nn.attention import SDPBackend, sdpa_kernel
 
             with sdpa_kernel(SDPBackend.MATH):
                 out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         else:
+            k = k.repeat_interleave(self.num_kv_groups, dim=1)
+            v = v.repeat_interleave(self.num_kv_groups, dim=1)
             out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
 
         out = out.transpose(1, 2).contiguous().view(batch, seq_len, -1)
@@ -213,8 +251,23 @@ class Qwen3DecoderLayer(nn.Module):
         self.post_attention_layernorm = Qwen3RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.mlp = Qwen3MLP(config)
 
-    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-        x = x + self.self_attn(self.input_layernorm(x), cos, sin)
+    def forward(
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        position_ids: torch.Tensor = None,
+        gathered_position_ids: torch.Tensor = None,
+        cp_group=None,
+    ) -> torch.Tensor:
+        x = x + self.self_attn(
+            self.input_layernorm(x),
+            cos,
+            sin,
+            position_ids,
+            gathered_position_ids,
+            cp_group,
+        )
         return x + self.mlp(self.post_attention_layernorm(x))
 
 
@@ -246,13 +299,58 @@ class Qwen3ForCausalLM(nn.Module):
         return_logits: bool = True,
         labels_shifted: bool = False,
     ):
-        x = self.embed_tokens(input_ids)
-        cos, sin = self.rotary_emb(input_ids.shape[1], x.dtype)
+        cp_group = getattr(self, "_cp_group", None)
+        if cp_group is not None:
+            from nano_megatron.parallel.context_parallel import (
+                context_parallel_global_indices,
+                context_parallel_indices,
+            )
+
+            global_seq_len = input_ids.shape[1]
+            position_ids = context_parallel_indices(
+                global_seq_len,
+                self._cp_rank,
+                self._cp_size,
+                device=input_ids.device,
+            )
+            gathered_position_ids = context_parallel_global_indices(
+                global_seq_len,
+                self._cp_size,
+                device=input_ids.device,
+            )
+            local_input_ids = input_ids.index_select(1, position_ids)
+        else:
+            global_seq_len = input_ids.shape[1]
+            position_ids = None
+            gathered_position_ids = None
+            local_input_ids = input_ids
+
+        x = self.embed_tokens(local_input_ids)
+        cos, sin = self.rotary_emb(global_seq_len, x.dtype)
+        if position_ids is not None:
+            cos = cos.index_select(2, position_ids)
+            sin = sin.index_select(2, position_ids)
         for layer in self.layers:
             if self.gradient_checkpointing and self.training:
-                x = torch.utils.checkpoint.checkpoint(layer, x, cos, sin, use_reentrant=False)
+                x = checkpoint(
+                    layer,
+                    x,
+                    cos,
+                    sin,
+                    position_ids,
+                    gathered_position_ids,
+                    cp_group,
+                    use_reentrant=False,
+                )
             else:
-                x = layer(x, cos, sin)
+                x = layer(
+                    x,
+                    cos,
+                    sin,
+                    position_ids,
+                    gathered_position_ids,
+                    cp_group,
+                )
         x = self.norm(x)
         if getattr(self, "_tp_vocab", False) and labels is not None:
             from nano_megatron.parallel.qwen3_tensor_parallel import vocab_parallel_cross_entropy
@@ -270,6 +368,33 @@ class Qwen3ForCausalLM(nn.Module):
 
         # Qwen3 ties the LM head to the token embedding matrix.
         loss = None
+        if cp_group is not None:
+            from nano_megatron.parallel.context_parallel import context_parallel_loss
+
+            if labels is not None:
+                if labels_shifted:
+                    loss_hidden = x
+                    loss_targets = labels.index_select(1, position_ids)
+                else:
+                    valid = position_ids < global_seq_len - 1
+                    loss_hidden = x[:, valid]
+                    loss_targets = labels.index_select(
+                        1, position_ids[valid] + 1
+                    )
+                loss_logits = F.linear(loss_hidden, self.embed_tokens.weight)
+                local_loss_sum = causal_cross_entropy(
+                    loss_logits,
+                    loss_targets,
+                    reduction="sum",
+                )
+                loss = context_parallel_loss(
+                    local_loss_sum,
+                    loss_targets.numel(),
+                    cp_group,
+                )
+            logits = F.linear(x, self.embed_tokens.weight) if return_logits else None
+            return {"logits": logits, "loss": loss}
+
         if labels is not None and not return_logits:
             loss_hidden = x if labels_shifted else x[:, :-1]
             loss_targets = labels if labels_shifted else labels[:, 1:]

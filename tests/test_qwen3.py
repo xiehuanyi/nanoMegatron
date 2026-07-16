@@ -3,6 +3,10 @@ from types import SimpleNamespace
 import torch
 
 from nano_megatron.qwen3 import Qwen3ForCausalLM, causal_cross_entropy
+from nano_megatron.parallel.context_parallel import (
+    context_parallel_global_indices,
+    context_parallel_indices,
+)
 from nano_megatron.utils import load_config
 
 
@@ -51,6 +55,41 @@ def test_causal_cross_entropy_matches_pytorch():
     loss.backward()
     reference_loss.backward()
     torch.testing.assert_close(logits.grad, reference_logits.grad)
+
+
+def test_causal_cross_entropy_sum_matches_pytorch():
+    torch.manual_seed(1234)
+    logits = torch.randn(2, 7, 31, requires_grad=True)
+    reference_logits = logits.detach().clone().requires_grad_(True)
+    targets = torch.randint(0, logits.shape[-1], logits.shape[:-1])
+
+    loss = causal_cross_entropy(logits, targets, reduction="sum")
+    reference_loss = torch.nn.functional.cross_entropy(
+        reference_logits.view(-1, reference_logits.shape[-1]),
+        targets.view(-1),
+        reduction="sum",
+    )
+    torch.testing.assert_close(loss, reference_loss)
+
+    loss.backward()
+    reference_loss.backward()
+    torch.testing.assert_close(logits.grad, reference_logits.grad)
+
+
+def test_context_parallel_zigzag_indices_cover_sequence():
+    seq_len = 32
+    world_size = 4
+    shards = [
+        context_parallel_indices(seq_len, rank, world_size)
+        for rank in range(world_size)
+    ]
+    assert all(shard.numel() == seq_len // world_size for shard in shards)
+    gathered = context_parallel_global_indices(seq_len, world_size)
+    torch.testing.assert_close(gathered, torch.cat(shards))
+    torch.testing.assert_close(
+        gathered.sort().values,
+        torch.arange(seq_len),
+    )
 
 
 def test_megatron_math_attention_forward_backward():

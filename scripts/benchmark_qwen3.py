@@ -50,7 +50,11 @@ def main():
     parser.add_argument("--profile-output")
     parser.add_argument("--profile-step-start", type=int, default=10)
     parser.add_argument("--profile-step-end", type=int, default=13)
-    parser.add_argument("--strategy", choices=("none", "ddp", "zero2", "tp"), default="none")
+    parser.add_argument(
+        "--strategy",
+        choices=("none", "ddp", "zero2", "tp", "cp"),
+        default="none",
+    )
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -64,24 +68,28 @@ def main():
     if bench.dtype != "float16":
         raise ValueError("The portable baseline currently requires dtype=float16")
 
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    torch.cuda.set_device(local_rank)
     distributed = args.strategy != "none"
     if distributed:
         dist.init_process_group("nccl")
     rank = dist.get_rank() if distributed else 0
     world_size = dist.get_world_size() if distributed else 1
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
 
     torch.manual_seed(bench.seed)
     torch.cuda.manual_seed_all(bench.seed)
     torch.backends.cuda.matmul.allow_tf32 = False
 
-    torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
     model = Qwen3ForCausalLM(config.model).half()
     if args.strategy == "tp":
         from nano_megatron.parallel.qwen3_tensor_parallel import parallelize_qwen3
 
         model = parallelize_qwen3(model)
+    elif args.strategy == "cp":
+        from nano_megatron.parallel.context_parallel import parallelize_qwen3_context
+
+        model = parallelize_qwen3_context(model)
     # TP replacement layers are constructed after the initial cast, so cast once more.
     model = model.half().to(device)
     if bench.gradient_checkpointing:
@@ -104,7 +112,7 @@ def main():
         group["betas"] = (bench.adam_beta1, bench.adam_beta2)
         group["eps"] = bench.adam_eps
 
-    input_seed = bench.seed if args.strategy == "tp" else bench.seed + rank
+    input_seed = bench.seed if args.strategy in ("tp", "cp") else bench.seed + rank
     generator = torch.Generator(device=device).manual_seed(input_seed)
     token_stream = torch.randint(
         0,
@@ -169,6 +177,13 @@ def main():
 
             with torch.profiler.record_function("nano::tp_grad_sync"):
                 sync_replicated_grads(model)
+        elif args.strategy == "cp":
+            from nano_megatron.parallel.context_parallel import (
+                sync_context_parallel_grads,
+            )
+
+            with torch.profiler.record_function("nano::cp_grad_sync"):
+                sync_context_parallel_grads(model)
         if args.strategy == "zero2":
             with torch.profiler.record_function("nano::grad_sync_copy_norm"):
                 grad_norms.append(optimizer.grad_norm())
@@ -253,6 +268,7 @@ def main():
         "strategy": args.strategy,
         "world_size": world_size,
         "data_parallel_size": data_parallel_size,
+        "context_parallel_size": world_size if args.strategy == "cp" else 1,
         "model": config.model.name,
         "parameter_count": base_model.parameter_count(),
         "dtype": bench.dtype,
@@ -263,7 +279,11 @@ def main():
         "warmup_steps": warmup_steps,
         "measure_steps": measure_steps,
         "gradient_checkpointing": bench.gradient_checkpointing,
-        "input_protocol": "rank-local fixed tokens, shared generator with Megatron",
+        "input_protocol": (
+            "replicated fixed tokens, zigzag context shards"
+            if args.strategy == "cp"
+            else "rank-local fixed tokens, shared generator with Megatron"
+        ),
         "rank0_input_sum": token_stream.sum().item() if rank == 0 else None,
         "rank0_input_prefix": token_stream[0, :8].tolist() if rank == 0 else None,
         "cross_step_overlap": args.cross_step_overlap,
