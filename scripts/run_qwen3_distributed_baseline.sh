@@ -18,6 +18,10 @@ PYTHON=${PYTHON:-/ibex/project/c2334/huanyi/conda_env/finetuning/bin/python}
 TORCHRUN=${TORCHRUN:-/ibex/project/c2334/huanyi/conda_env/finetuning/bin/torchrun}
 CONFIG=${CONFIG:-configs/qwen3_0.6b_benchmark.yaml}
 BENCHMARK_MODE=${BENCHMARK_MODE:-dp2}
+SEQ_LEN=1024
+CP_SIZE=1
+TRANSFORMER_IMPL=local
+ATTENTION_BACKEND=${ATTENTION_BACKEND:-unfused}
 
 case "$BENCHMARK_MODE" in
     dp2)
@@ -35,6 +39,21 @@ case "$BENCHMARK_MODE" in
         GLOBAL_TOKENS=1024
         PROTOCOL=T0-tp2
         MCORE_PARALLEL_ARGS=()
+        ;;
+    cp2)
+        NANO_STRATEGY=cp
+        GLOBAL_BATCH=1
+        TP_SIZE=1
+        CP_SIZE=2
+        SEQ_LEN=2048
+        GLOBAL_TOKENS=2048
+        TRANSFORMER_IMPL=transformer_engine
+        ATTENTION_BACKEND=${CP_ATTENTION_BACKEND:-auto}
+        PROTOCOL=${PROTOCOL:-CP-B1-cp2-all-gather}
+        MCORE_PARALLEL_ARGS=(
+            --context-parallel-size "$CP_SIZE"
+            --cp-comm-type all_gather
+        )
         ;;
     *)
         echo "Unknown BENCHMARK_MODE=$BENCHMARK_MODE" >&2
@@ -130,7 +149,8 @@ run_sampled() {
 
 run_sampled "$OUT_DIR/nano_memory.csv" \
     "$TORCHRUN" --standalone --nproc_per_node=2 scripts/benchmark_qwen3.py \
-    --config "$CONFIG" --strategy "$NANO_STRATEGY" --output "$OUT_DIR/nano.json" \
+    --config "$CONFIG" --strategy "$NANO_STRATEGY" --seq-len "$SEQ_LEN" \
+    --output "$OUT_DIR/nano.json" \
     "${NANO_EXTRA_ARGS[@]}" \
     2>&1 | tee "$OUT_DIR/nano.log"
 
@@ -139,8 +159,8 @@ run_sampled "$REPO_DIR/$OUT_DIR/megatron_memory.csv" \
     "$TORCHRUN" --standalone --nproc_per_node=2 \
     "$REPO_DIR/scripts/benchmark_megatron_qwen3.py" \
     --use-mcore-models \
-    --transformer-impl local \
-    --attention-backend unfused \
+    --transformer-impl "$TRANSFORMER_IMPL" \
+    --attention-backend "$ATTENTION_BACKEND" \
     --num-layers 28 \
     --hidden-size 1024 \
     --ffn-hidden-size 3072 \
@@ -148,7 +168,7 @@ run_sampled "$REPO_DIR/$OUT_DIR/megatron_memory.csv" \
     --group-query-attention \
     --num-query-groups 8 \
     --kv-channels 128 \
-    --seq-length 1024 \
+    --seq-length "$SEQ_LEN" \
     --max-position-embeddings 40960 \
     --position-embedding-type rope \
     --rotary-percent 1.0 \

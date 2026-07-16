@@ -6,11 +6,13 @@ from functools import partial
 
 import torch
 
+from megatron.core import parallel_state
 from megatron.core.enums import ModelType
 import megatron.core.optimizer as mcore_optimizer
 from megatron.core.optimizer import distrib_optimizer as mcore_distrib_optimizer
 from megatron.core.optimizer import optimizer as mcore_optimizer_impl
 from megatron.training import get_args, inprocess_restart, pretrain
+from megatron.training.utils import get_batch_on_this_cp_rank
 
 import pretrain_gpt
 from gpt_builders import gpt_builder
@@ -48,8 +50,15 @@ def _get_fixed_batch(data_iterator, vp_stage=None):
         else:
             args = get_args()
             device = original[0].device
+            # CP ranks must start from the same global sequence before
+            # Megatron applies its zigzag context slice.
+            input_rank = (
+                parallel_state.get_data_parallel_rank()
+                if args.context_parallel_size > 1
+                else torch.distributed.get_rank()
+            )
             generator = torch.Generator(device=device).manual_seed(
-                args.seed + torch.distributed.get_rank()
+                args.seed + input_rank
             )
             token_stream = torch.randint(
                 0,
@@ -69,7 +78,15 @@ def _get_fixed_batch(data_iterator, vp_stage=None):
                     f"prefix={token_stream[0, :8].tolist()}",
                     flush=True,
                 )
-            _CACHED_BATCHES[key] = (tokens, labels, loss_mask, None, position_ids)
+            batch = {
+                "tokens": tokens,
+                "labels": labels,
+                "loss_mask": loss_mask,
+                "attention_mask": None,
+                "position_ids": position_ids,
+            }
+            batch = get_batch_on_this_cp_rank(batch)
+            _CACHED_BATCHES[key] = tuple(batch.values())
     return _CACHED_BATCHES[key]
 
 

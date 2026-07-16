@@ -234,6 +234,25 @@ post-backward replicated-weight AllReduce costs about 31.4 ms/step. At this
 sequence length, overlapping/bucketing weight-gradient reduction is a larger
 next win than replacing the K/V path alone.
 
+The first Megatron head-to-head (`CP-B1`, job `48988648`) ran on 2×A100 with
+the same Qwen3-0.6B shape, fixed token stream, FP16, sequence length 2048,
+CP=2, micro/global batch 1, optimizer hyperparameters, and synchronous
+`all_gather` CP communication:
+
+| Engine | tok/s | mean step | peak `nvidia-smi` HBM |
+|---|---:|---:|---:|
+| nanoMegatron | 11299.8 | 181.24 ms | 14363 MiB |
+| Megatron Core | 8587.7 | 238.48 ms | 14333 MiB |
+
+nano/Megatron is `1.316x` for throughput and `1.002x` for sampled HBM, so this
+exploratory run passes the 95% speed and 105% memory thresholds. It is not yet
+a strict promotion to `DONE`: Transformer Engine disables unfused attention
+whenever CP is enabled, so Megatron used TE FusedAttention while nano used its
+Megatron-style math backend. FlashAttention was not installed. The V100
+attempt (`48988407`) therefore failed on the Megatron side with no supported
+CP attention backend. Formal acceptance still needs the same attention backend
+and a three-job median.
+
 Two head-to-head runs on Ibex, full 3.8B Phi-tiny-MoE (32 layers, 16 experts top-2), `seq_len=96`, `batch_size=1`, `grad_accum=1`, gradient checkpointing on, fp16, 10 steps. nanoMegatron, DeepSpeed 0.18.9, PyTorch FSDP all run on the same checkpoint with the same script (`scripts/run_v100_benchmark.sh` / `scripts/run_4gpu_benchmarks.sh`).
 
 ### 4× Tesla V100 SXM2-32GB (NVLink)

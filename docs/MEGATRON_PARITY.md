@@ -102,8 +102,27 @@ AllGather、56 次反向 ReduceScatter 和约 32 次权重梯度 AllReduce。NCC
 权重梯度 AllReduce `31.41 ms/step`。所以 seq=2048 下下一步先做梯度 bucket
 overlap 的收益可能大于只替换 ring attention 通信。
 
-上述性能数据还没有 Megatron CP2 对照，也没有三次独立运行，所以不能用于把 M09
-标成 `DONE`。
+前述 `CP-S0/CP-B0` 数据本身没有 Megatron CP2 对照，不能用于把 M09 标成
+`DONE`。
+
+### CP-B1 Megatron Core 对照
+
+Job `48988648` 在同一台 2×A100 节点上依次运行 nano 和 Megatron Core：
+
+- 相同：Qwen3-0.6B shape、固定 token stream（sum/prefix 一致）、FP16、seq=2048、
+  CP=2、micro/global batch=1、Adam 超参、`cp_comm_type=all_gather`。
+- 不同：nano 使用 `megatron_math` attention；Megatron 的 TE 2.9 在 CP 下明确禁用
+  unfused backend，并且环境未安装 FlashAttention，因此实际使用 FusedAttention。
+  Megatron optimizer 为 TE FusedAdam，nano 为 torch AdamW，更新语义已在独立实验核对。
+
+| 实验 | nano tok/s | Megatron tok/s | 速度比 | nano/Megatron sampled HBM |
+|---|---:|---:|---:|---:|
+| CP-B1* `48988648` | 11299.8 | 8587.7 | 1.316 | 1.002 |
+
+单次探索已经通过速度 `>=0.95` 和显存 `<=1.05` 门槛，但 `*` 表示不能正式验收：
+attention backend 尚未相同，也没有三次独立运行的中位数。V100 job `48988407`
+验证了硬件限制：Megatron TE CP 不支持 unfused attention，而该节点又没有可用的
+Flash/Fused CP backend，因此参考侧在首个 forward 退出。
 
 每完成一行，都要把代码 revision 和对应实验 ID 回填到本表，不能只把“能跑”标成
 `DONE`。
