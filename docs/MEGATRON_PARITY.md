@@ -26,7 +26,7 @@ attention backend 下，让 nanoMegatron 达到 Megatron Core 的训练吞吐和
 | M03 | Tensor Parallel | Column/Row parallel，Phi-MoE 路径 | PARTIAL | TP=2/4 吞吐、显存、通信次数 | P0 |
 | M04 | Sequence Parallel | 当前仅 stub/有限路径 | PARTIAL | TP+SP 激活显存和 numerics | P0 |
 | M05 | Data Parallel DDP | 手写 all-reduce | DONE | bucket size、overlap 后达到 DP 基线 | P0 |
-| M06 | Distributed Optimizer | dtype flat buffer + 等长 tensor shard + RS/AG | PARTIAL | D4 三次运行验收 | P0 |
+| M06 | Distributed Optimizer | dtype flat buffer + 等长 tensor shard + RS/AG | PARTIAL | D6 三次运行验收 | P0 |
 | M07 | Pipeline Parallel | GPipe | PARTIAL | 1F1B、bubble、P2P overlap | P1 |
 | M08 | Interleaved/virtual PP | 无 | TODO | VPP schedule 与 bubble | P1 |
 | M09 | Context Parallel | 无 | TODO | 长序列 ring P2P/all-gather 路径 | P1 |
@@ -45,7 +45,7 @@ attention backend 下，让 nanoMegatron 达到 Megatron Core 的训练吞吐和
 | M22 | Fused QKV/MLP GEMM | fused QKV 和 gate/up projection | DONE | D2 `48908022` | P0 |
 | M23 | Fused RoPE | D4 缓存 cos/sin，仍是 PyTorch pointwise graph | PARTIAL | kernel 数量和 HBM traffic | P1 |
 | M24 | Cross entropy | D4 custom autograd，FP32 in-place softmax，不保留返回 logits | PARTIAL | DP 已对齐，TP vocab-parallel backward 继续核对 | P0 |
-| M25 | Fused optimizer | fused torch AdamW，main-grad copy/scale 仍为独立 kernel | PARTIAL | optimizer step time、state memory | P0 |
+| M25 | Fused optimizer | nano 使用 fused torch AdamW；Megatron D6 使用 TE FusedAdam | PARTIAL | optimizer step time、state memory | P0 |
 | M26 | FP8 / Transformer Engine | 无 | TODO | H100/A100 可用矩阵分别验收 | P2 |
 | M27 | CUDA Graph | 无 | TODO | steady-state launch overhead | P2 |
 | M28 | MoE router aux/z loss | 无 | TODO | loss 与梯度正确性 | P1 |
@@ -85,6 +85,7 @@ attention backend 下，让 nanoMegatron 达到 Megatron Core 的训练吞吐和
 | D3* (+ param AG overlap) | DP2 + distributed optimizer | 5020.1 | 5815.9 | 0.863 | 1.272 | 单次探索，尚未正式验收 |
 | D4 (compute graph parity) | DP2 + distributed optimizer | 8435.2 | 7610.8 | 1.108 | 1.017 | 三次中位数，速度和显存均达标 |
 | D5 (identical fixed input) | DP2 + distributed optimizer | 8437.2 | 7729.2 | 1.092 | 1.017 | 三次中位数，消除输入行为差异后仍达标 |
+| D6 (TE fused optimizer) | DP2 + distributed optimizer | 8436.0 | 8186.8 | 1.031 | 1.017 | 三次中位数，Megatron 启用 TE 后差距收窄到 3.1% |
 | T0 | TP2 | 4860.1 | 4562.5 | 1.067 | 1.062 | 速度达标，显存未达标 |
 
 以上均为 3 次独立运行的中位数。D0 定位出的整 bucket AllReduce、完整 parameter
@@ -145,6 +146,33 @@ Megatron 每步多 `763` 个 CUDA launch，多约 `29.9 ms` aggregate kernel tim
    `cudaLaunchKernel` CPU 时间比 nano 多 `24.7 ms`。
 4. 两边主要 FP16 GEMM kernel 时间接近，因此优势不是少算 layer、hidden size 或
    token，而是 optimizer 和通用框架小 kernel/launch 开销。
+
+D6 在相同 PyTorch 2.8.0+cu128 环境中安装 Megatron 锁定的 Transformer Engine
+2.9.0。PyPI 的 core 库有 CUDA 12 wheel，但 PyTorch binding 需要本地编译；初次
+编译分别因找不到 `cudnn.h` 和 `nccl.h` 失败。将
+`site-packages/nvidia/*/include` 和 `site-packages/nvidia/*/lib` 加入编译/链接
+路径后构建成功。运行日志确认实际后端为
+`transformer_engine.pytorch.optimizers.fused_adam.FusedAdam`，multi-tensor kernel
+来自 `transformer_engine_torch`，不再使用 torch/local fallback。
+
+D6 三次运行 `48981508/48981561/48981562` 的中位数为 nano
+`8436.0 tok/s`、Megatron `8186.8 tok/s`，速度比 `1.031`；峰值显存为
+`11710/11510 MiB`，显存比 `1.017`。Megatron 相对 D5 提升 `5.9%`。其中
+`48980514` 和 `48981561` 位于同一 `gpu212-02` 节点，Megatron 从
+`7702.7` 提升到 `8186.8 tok/s`，排除了大部分跨节点差异。
+
+D6 profiling job `48981563` 显示 Megatron steady optimizer inner step 从
+`28.68 ms` 降到 `12.32 ms`，optimizer total 从 `44.46 ms` 降到 `25.38 ms`。
+同一 profile job 内，Megatron 相对 nano 的额外 aggregate CUDA kernel time 为
+`7.54 ms/step`，低于 D5 的 `29.94 ms/step`；额外 launch 数从 `763` 降到
+`534/step`。剩余差距主要不在 Adam，而在通用 TP-capable module wrapper、
+main-grad copy/check、RoPE pointwise graph 和 Python/launch 调度。
+
+TE FusedAdam 与 fused torch AdamW 的独立正确性 job `48981695` 使用 1,000,003 个
+FP32 参数、相同梯度和 D6 的 Adam 超参数运行 20 步。首步参数最大绝对误差
+`3.73e-9`；20 步后参数最大绝对误差 `2.38e-7`、cosine
+`0.9999999999999999`，optimizer state cosine 均高于
+`0.99999999999999`。该误差属于不同 fused kernel 的 FP32 舍入差异。
 
 ## 参考口径
 

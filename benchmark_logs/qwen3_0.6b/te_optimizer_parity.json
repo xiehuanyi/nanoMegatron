@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "torch": "2.8.0+cu128",
+  "cuda": "12.8",
+  "numel": 1000003,
+  "steps": 20,
+  "hyperparameters": {
+    "lr": 0.0001,
+    "betas": [
+      0.9,
+      0.95
+    ],
+    "eps": 1e-08,
+    "weight_decay": 0.0
+  },
+  "after_first_step": {
+    "max_abs": 3.725290298461914e-09,
+    "mean_abs": 4.9679975862879125e-14,
+    "cosine": 1.0
+  },
+  "after_final_step": {
+    "parameter": {
+      "max_abs": 2.384185791015625e-07,
+      "mean_abs": 7.204428378319499e-11,
+      "cosine": 0.9999999999999999
+    },
+    "exp_avg": {
+      "max_abs": 2.980232238769531e-07,
+      "mean_abs": 3.381664734555986e-08,
+      "cosine": 0.9999999999999908
+    },
+    "exp_avg_sq": {
+      "max_abs": 5.960464477539062e-07,
+      "mean_abs": 9.146314987593505e-08,
+      "cosine": 0.9999999999999969
+    }
+  }
+}

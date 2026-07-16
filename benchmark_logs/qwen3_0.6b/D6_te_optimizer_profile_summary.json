@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "protocol": "D6-dp2-te-fused-optimizer-profile",
+  "formal_jobs": [
+    48981508,
+    48981561,
+    48981562
+  ],
+  "profile_job": 48981563,
+  "software": {
+    "torch": "2.8.0+cu128",
+    "transformer_engine": "2.9.0",
+    "transformer_engine_torch": "2.9.0",
+    "transformer_engine_cu12": "2.9.0",
+    "apex": "not-installed"
+  },
+  "optimizer_backend": {
+    "adam": "transformer_engine.pytorch.optimizers.fused_adam.FusedAdam",
+    "distributed": "transformer_engine",
+    "multi_tensor": "transformer_engine_torch"
+  },
+  "three_job_median": {
+    "nano_tokens_per_second": 8436.046706076473,
+    "megatron_tokens_per_second": 8186.76047329709,
+    "throughput_ratio_nano_over_megatron": 1.0305286863797194,
+    "nano_peak_smi_mib": 11710.0,
+    "megatron_peak_smi_mib": 11510.0,
+    "memory_ratio_nano_over_megatron": 1.0173761946133797,
+    "megatron_throughput_improvement_vs_d5_percent": 5.920211064918468
+  },
+  "megatron_internal_timers_ms": {
+    "forward_compute_max": 104.52,
+    "backward_compute_max": 162.57,
+    "optimizer_copy_to_main_grad_max": 3.72,
+    "optimizer_unscale_and_check_inf_max": 4.5,
+    "optimizer_inner_step_max": 12.32,
+    "optimizer_copy_main_to_model_params_max": 3.05,
+    "optimizer_total_max": 25.38
+  },
+  "optimizer_improvement_vs_d5_percent": {
+    "inner_step": 57.04323570432357,
+    "total": 42.91497975708503
+  },
+  "three_profiled_steps": {
+    "nano_cuda_kernel_time_ms": 1022.9275110000049,
+    "megatron_cuda_kernel_time_ms": 1045.5609269999993,
+    "extra_megatron_kernel_time_per_step_ms": 7.544471999998147,
+    "nano_cuda_launch_count": 15180,
+    "megatron_cuda_launch_count": 16782,
+    "extra_megatron_cuda_launches_per_step": 534,
+    "nano_cuda_launch_cpu_time_ms": 90.41351600000007,
+    "megatron_cuda_launch_cpu_time_ms": 108.82878599999961
+  },
+  "diagnosis": [
+    "Transformer Engine FusedAdam replaces Megatron's torch optimizer and local multi-tensor fallbacks.",
+    "The steady optimizer inner step falls from 28.68 ms to 12.32 ms, and total optimizer time falls from 44.46 ms to 25.38 ms.",
+    "The three-run median Megatron throughput improves by 5.92 percent while nanoMegatron remains flat.",
+    "Within the profiled job, Megatron's extra aggregate CUDA kernel time shrinks from 29.94 ms to 7.54 ms per step and its extra launch count shrinks from 763 to 534 per step.",
+    "The remaining gap is primarily outside Adam: generic model wrappers, main-grad copy/check work, repeated RoPE pointwise kernels, and framework launch overhead."
+  ]
+}

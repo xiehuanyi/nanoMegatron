@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """Megatron pretrain entry point with a rank-local fixed benchmark batch."""
 
+import os
 from functools import partial
 
 import torch
 
 from megatron.core.enums import ModelType
+import megatron.core.optimizer as mcore_optimizer
+from megatron.core.optimizer import distrib_optimizer as mcore_distrib_optimizer
+from megatron.core.optimizer import optimizer as mcore_optimizer_impl
 from megatron.training import get_args, inprocess_restart, pretrain
 
 import pretrain_gpt
@@ -15,6 +19,24 @@ from model_provider import model_provider
 
 _CACHED_BATCHES = {}
 _ORIGINAL_GET_BATCH = pretrain_gpt.get_batch
+
+
+def _print_optimizer_backend():
+    if os.environ.get("RANK", "0") != "0":
+        return
+    if mcore_distrib_optimizer.USING_TE_OPTIMIZER:
+        distributed_backend = "transformer_engine"
+    elif mcore_distrib_optimizer.USING_APEX_OPTIMIZER:
+        distributed_backend = "apex"
+    else:
+        distributed_backend = "torch"
+    print(
+        "MCORE_OPTIMIZER_BACKEND "
+        f"adam={mcore_optimizer.Adam.__module__}.{mcore_optimizer.Adam.__name__} "
+        f"distributed={distributed_backend} "
+        f"multi_tensor={mcore_optimizer_impl.multi_tensor_scale_impl.__module__}",
+        flush=True,
+    )
 
 
 def _get_fixed_batch(data_iterator, vp_stage=None):
@@ -52,6 +74,7 @@ def _get_fixed_batch(data_iterator, vp_stage=None):
 
 
 def main():
+    _print_optimizer_backend()
     pretrain_gpt.get_batch = _get_fixed_batch
     pretrain_gpt.train_valid_test_datasets_provider.is_distributed = True
     wrapped_pretrain, store = inprocess_restart.maybe_wrap_for_inprocess_restart(pretrain)

@@ -69,9 +69,10 @@ and at most 105% peak HBM under the same topology.
 | D3* | 5020.1 | 5815.9 | 0.863 | 1.272 | launch AllGather in forward order and wait from module pre-hooks |
 | D4 | 8435.2 | 7610.8 | 1.108 | 1.017 | Megatron-style math attention, RMSNorm/RoPE/CE alignment, exact bucket packing |
 | D5 | 8437.2 | 7729.2 | 1.092 | 1.017 | rank-local input tokens are identical and fixed in both engines |
+| D6 | 8436.0 | 8186.8 | 1.031 | 1.017 | install TE 2.9.0; Megatron uses TE FusedAdam and multi-tensor kernels |
 
-`D0`, `D1`, and `D4` are three-job medians. `D2` and `D3` are one-job exploratory
-runs and are not promoted to formal results. Raw summaries and the exact
+`D0`, `D1`, and `D4` through `D6` are three-job medians. `D2` and `D3` are
+one-job exploratory runs and are not promoted to formal results. Raw summaries and the exact
 protocol live in `benchmark_logs/qwen3_0.6b/`; the maintained feature and
 acceptance matrix is in `docs/MEGATRON_PARITY.md`.
 
@@ -124,11 +125,31 @@ What the attempts taught us:
     generic TP-capable linear wrappers, FP32 main-grad checks/scaling, extra
     pointwise/cat/copy kernels, and repeated RoPE cos/sin application. Large GEMM
     runtimes are nearly identical.
+11. D6 installs Transformer Engine 2.9.0, the version required by the pinned
+    Megatron checkout. The first source-build attempt failed on `cudnn.h`; the
+    second reached `nccl.h`. Adding the pip CUDA packages' `include` and `lib`
+    directories to `CPATH`, `CPLUS_INCLUDE_PATH`, `LIBRARY_PATH`, and
+    `LD_LIBRARY_PATH` produced a working V100 build. The benchmark now logs the
+    selected optimizer backend and package versions, so a silent torch fallback
+    cannot be mistaken for a production Megatron result.
+12. TE changes the conclusion materially. Megatron's three-run median rises
+    5.9%, from 7729.2 to 8186.8 tok/s, while nano stays flat. Profiling shows the
+    inner optimizer step falling from 28.68 to 12.32 ms and total optimizer time
+    from 44.46 to 25.38 ms. The remaining median gap is 3.1%, and the profiled
+    extra CUDA kernel time shrinks from 29.9 to 7.5 ms/step. A direct 20-step
+    optimizer check against fused torch AdamW gives parameter max error
+    `2.38e-7` and cosine `0.9999999999999999`, so the gain is not from changing
+    the Adam update semantics.
+
+The environment-specific build is captured in
+`scripts/install_transformer_engine.sh`; on the V100 benchmark environment it
+is reproduced with `TORCH_CUDA_ARCH_LIST=7.0 scripts/install_transformer_engine.sh`.
 
 Jobs: D1 `48899170`, `48901884`, `48901885`; D2 `48908022`; D3 `48908122`;
 D4 `48977678`, `48979015`, `48979016`; D5 `48980514`, `48980551`,
-`48980552`; profiling `48980515`.
-Correctness: FP32 `48980002`, FP16 `48980005`.
+`48980552`; D6 `48981508`, `48981561`, `48981562`; profiling D5 `48980515`,
+profiling D6 `48981563`.
+Correctness: FP32 `48980002`, FP16 `48980005`, TE optimizer `48981695`.
 
 Two head-to-head runs on Ibex, full 3.8B Phi-tiny-MoE (32 layers, 16 experts top-2), `seq_len=96`, `batch_size=1`, `grad_accum=1`, gradient checkpointing on, fp16, 10 steps. nanoMegatron, DeepSpeed 0.18.9, PyTorch FSDP all run on the same checkpoint with the same script (`scripts/run_v100_benchmark.sh` / `scripts/run_4gpu_benchmarks.sh`).
 

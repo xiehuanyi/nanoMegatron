@@ -25,7 +25,7 @@ case "$BENCHMARK_MODE" in
         GLOBAL_BATCH=2
         TP_SIZE=1
         GLOBAL_TOKENS=2048
-        PROTOCOL=D5-dp2-identical-fixed-input
+        PROTOCOL=${PROTOCOL:-D5-dp2-identical-fixed-input}
         MCORE_PARALLEL_ARGS=(--use-distributed-optimizer --overlap-grad-reduce --overlap-param-gather)
         ;;
     tp2)
@@ -88,6 +88,19 @@ test "$actual_megatron_rev" = "$MEGATRON_LM_REV"
 
 nvidia-smi --query-gpu=index,name,memory.total,driver_version --format=csv > "$OUT_DIR/hardware.csv"
 nvidia-smi topo -m > "$OUT_DIR/topology.txt"
+"$PYTHON" - <<'PY' > "$OUT_DIR/software.txt"
+from importlib.metadata import PackageNotFoundError, version
+
+import torch
+
+print(f"torch={torch.__version__}")
+print(f"torch_cuda={torch.version.cuda}")
+for package in ("transformer-engine", "transformer-engine-torch", "transformer-engine-cu12", "apex"):
+    try:
+        print(f"{package}={version(package)}")
+    except PackageNotFoundError:
+        print(f"{package}=not-installed")
+PY
 
 sample_memory() {
     local output=$1
