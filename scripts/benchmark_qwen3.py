@@ -103,17 +103,19 @@ def main():
 
     input_seed = bench.seed if args.strategy == "tp" else bench.seed + rank
     generator = torch.Generator(device=device).manual_seed(input_seed)
-    tokens = torch.randint(
+    token_stream = torch.randint(
         0,
         config.model.vocab_size,
-        (bench.micro_batch_size, seq_len),
+        (bench.micro_batch_size, seq_len + 1),
         device=device,
         generator=generator,
     )
-    labels = tokens.clone()
+    tokens = token_stream[:, :-1].contiguous()
+    labels = token_stream[:, 1:].contiguous()
 
     durations = []
     losses = []
+    grad_norms = []
     timing_events = []
     total_steps = warmup_steps + measure_steps
     if distributed:
@@ -130,12 +132,19 @@ def main():
             torch.cuda.synchronize()
             start = time.perf_counter()
         optimizer.zero_grad()
-        output = model(tokens, labels=labels)
+        output = model(
+            tokens,
+            labels=labels,
+            return_logits=False,
+            labels_shifted=True,
+        )
         output["loss"].backward()
         if args.strategy == "tp":
             from nano_megatron.parallel.qwen3_tensor_parallel import sync_replicated_grads
 
             sync_replicated_grads(model)
+        if args.strategy == "zero2":
+            grad_norms.append(optimizer.grad_norm())
         optimizer.step()
         if args.cross_step_overlap:
             end_event.record()
@@ -252,6 +261,7 @@ def main():
             ).removeprefix("torch."),
             "gradient_collective": "reduce_scatter_tensor",
             "parameter_collective": "all_gather_into_tensor",
+            "final_grad_norm": grad_norms[-1],
         }
     if rank == 0:
         output_path = Path(args.output)

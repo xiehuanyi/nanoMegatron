@@ -67,6 +67,7 @@ and at most 105% peak HBM under the same topology.
 | D1 | 4770.0 | 5812.2 | 0.821 | 1.328 | dtype-flat buffers, balanced tensor shards, backward ReduceScatter, bucket AllGather |
 | D2* | 4974.5 | 5813.2 | 0.856 | 1.272 | fused QKV and SwiGLU input GEMMs, fused AdamW |
 | D3* | 5020.1 | 5815.9 | 0.863 | 1.272 | launch AllGather in forward order and wait from module pre-hooks |
+| D4 (running) | - | - | - | - | Megatron-style math attention, RMSNorm/RoPE/CE alignment, exact bucket packing |
 
 `D0` and `D1` are three-job medians. `D2` and `D3` are one-job exploratory
 runs and are not promoted to formal results yet. Raw summaries and the exact
@@ -85,12 +86,22 @@ What the attempts taught us:
 3. Parameter-gather overlap is correct and measurable, but only added 0.9% on
    this two-GPU PCIe topology. The remaining stable gap is about 56 ms/step and
    3.1 GiB of sampled HBM.
-4. The next work is evidence-driven: split forward/backward/RS/Adam/AG timings,
-   audit tensors saved by math SDPA and cross entropy, reuse main-grad storage,
-   then rerun three independent jobs. Activation checkpointing is not counted as
-   a fix while the Megatron side has recomputation disabled.
+4. D4 removes two benchmark mismatches that favored nanoMegatron: it predicts
+   all 1024 labels from a 1025-token stream, and computes the distributed gradient
+   norm/finite check every step just like the Megatron run.
+5. D4 also replaces PyTorch math SDPA with Megatron's unfused
+   `baddbmm -> fp16 softmax -> bmm` graph, uses `torch.nn.RMSNorm`, caches RoPE,
+   uses a custom in-place cross entropy without returning full logits, and packs
+   the distributed optimizer into the same 40M-element, overshoot-after-add
+   buckets. This produces 11 buckets instead of 13 for Qwen3-0.6B.
+6. After D4, the main known differences are communication scheduling and fusion:
+   gradient division and fp16-to-fp32 main-grad copies are separate kernels,
+   parameter AllGather waits use Python `Work.wait()`, and there is no Megatron
+   multi-tensor optimizer/overflow infrastructure. Activation checkpointing is
+   not counted as a fix while the Megatron side has recomputation disabled.
 
-Jobs: D1 `48899170`, `48901884`, `48901885`; D2 `48908022`; D3 `48908122`.
+Jobs: D1 `48899170`, `48901884`, `48901885`; D2 `48908022`; D3 `48908122`;
+D4 `48975002`.
 
 Two head-to-head runs on Ibex, full 3.8B Phi-tiny-MoE (32 layers, 16 experts top-2), `seq_len=96`, `batch_size=1`, `grad_accum=1`, gradient checkpointing on, fp16, 10 steps. nanoMegatron, DeepSpeed 0.18.9, PyTorch FSDP all run on the same checkpoint with the same script (`scripts/run_v100_benchmark.sh` / `scripts/run_4gpu_benchmarks.sh`).
 

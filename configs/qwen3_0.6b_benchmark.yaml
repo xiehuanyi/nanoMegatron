@@ -11,7 +11,7 @@ model:
   max_seq_len: 40960
   rms_norm_eps: 1.0e-6
   rope_theta: 1000000.0
-  attention_backend: "math"
+  attention_backend: "megatron_math"
 
 benchmark:
   seed: 1234

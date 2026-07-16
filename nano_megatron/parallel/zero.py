@@ -6,6 +6,7 @@ owns an equally-sized slice of each bucket, gradients are reduce-scattered
 during backward, and updated parameter slices are all-gathered after Adam.
 """
 
+import math
 from collections import defaultdict
 
 import torch
@@ -89,7 +90,7 @@ class _FlatBucket:
 class _FlatGradReducer:
     """Flat model-dtype gradients with ordered asynchronous ReduceScatter."""
 
-    def __init__(self, all_params, rank, world_size, group, bucket_size_mb):
+    def __init__(self, all_params, rank, world_size, group, bucket_size):
         self.rank = rank
         self.world_size = world_size
         self.group = group
@@ -101,22 +102,21 @@ class _FlatGradReducer:
 
         # Buckets follow backward order. A parameter larger than the target
         # remains intact so its post-accumulate hook is sufficient for readiness.
-        limit = bucket_size_mb * 1024 * 1024 // 4
         current = []
         current_numel = 0
         for p in reversed(all_params):
             different_storage = current and (
                 p.dtype != current[0].dtype or p.device != current[0].device
             )
-            if current and (
-                different_storage or current_numel + p.numel() > limit
-            ):
+            if different_storage:
                 self._add_bucket(current)
                 current = []
                 current_numel = 0
             current.append(p)
             current_numel += p.numel()
-            if current_numel >= limit:
+            # Megatron closes a bucket after crossing the element target. It
+            # does not split a parameter or prematurely flush the prior one.
+            if current_numel >= bucket_size:
                 self._add_bucket(current)
                 current = []
                 current_numel = 0
@@ -203,7 +203,7 @@ class ZeROOptimizer:
         lr: float,
         weight_decay: float,
         stage: int,
-        bucket_size_mb: int = 160,
+        bucket_size: int = 40_000_000,
         process_group=None,
         overlap_param_gather: bool = True,
     ):
@@ -227,7 +227,7 @@ class ZeROOptimizer:
         self._forward_hook_handles = []
 
         if stage == 2:
-            self._init_stage2(lr, weight_decay, bucket_size_mb)
+            self._init_stage2(lr, weight_decay, bucket_size)
             if overlap_param_gather:
                 self._register_param_gather_hooks(model)
         else:
@@ -280,13 +280,13 @@ class ZeROOptimizer:
             if work is not None:
                 work.wait()
 
-    def _init_stage2(self, lr, weight_decay, bucket_size_mb):
+    def _init_stage2(self, lr, weight_decay, bucket_size):
         self._grad_bucket = _FlatGradReducer(
             self.all_params,
             self.rank,
             self.world_size,
             self.group,
-            bucket_size_mb,
+            bucket_size,
         )
         self.fp32_copies = [
             torch.nn.Parameter(bucket.local_param.float(), requires_grad=True)
@@ -367,18 +367,30 @@ class ZeROOptimizer:
             self._finish_stage2_grad_sync()
             grads = [p.grad for p in self.fp32_copies]
 
-        device = grads[0].device
-        local_norm_sq = torch.zeros(1, device=device, dtype=torch.float32)
-        for grad in grads:
-            local_norm_sq += grad.float().pow(2).sum()
-
-        dist.all_reduce(local_norm_sq, op=dist.ReduceOp.SUM, group=self.group)
-        global_norm = local_norm_sq.sqrt().item()
+        global_norm = self._global_grad_norm(grads)
 
         if global_norm > max_norm and global_norm > 0:
             clip_coef = max_norm / global_norm
-            for grad in grads:
-                grad.mul_(clip_coef)
+            torch._foreach_mul_(grads, clip_coef)
+        return global_norm
+
+    def grad_norm(self):
+        """Return the distributed L2 norm without clipping, as Megatron reports it."""
+        if self.stage == 1:
+            self._reduce_zero1_grads()
+            grads = [p.grad for p in self.local_params if p.grad is not None]
+        else:
+            self._finish_stage2_grad_sync()
+            grads = [p.grad for p in self.fp32_copies]
+        return self._global_grad_norm(grads)
+
+    def _global_grad_norm(self, grads):
+        local_norms = torch._foreach_norm(grads, 2)
+        local_norm_sq = torch.stack(local_norms).square().sum()
+        dist.all_reduce(local_norm_sq, op=dist.ReduceOp.SUM, group=self.group)
+        global_norm = local_norm_sq.sqrt().item()
+        if not math.isfinite(global_norm):
+            raise FloatingPointError(f"non-finite distributed gradient norm: {global_norm}")
         return global_norm
 
     def step(self):

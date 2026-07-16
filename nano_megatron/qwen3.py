@@ -1,36 +1,135 @@
 """Minimal dense Qwen3 model used by the Megatron parity benchmark."""
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-class Qwen3RMSNorm(nn.Module):
+class Qwen3RMSNorm(nn.RMSNorm):
     def __init__(self, hidden_size: int, eps: float = 1e-6):
+        super().__init__(hidden_size, eps=eps)
+
+
+class Qwen3RotaryEmbedding(nn.Module):
+    def __init__(self, head_dim: int, theta: float):
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.eps = eps
+        inv_freq = 1.0 / (
+            theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim)
+        )
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self._cache = {}
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        dtype = x.dtype
-        x = x.float()
-        x = x * torch.rsqrt(x.square().mean(dim=-1, keepdim=True) + self.eps)
-        return (x * self.weight.float()).to(dtype)
+    def _apply(self, fn):
+        self._cache.clear()
+        return super()._apply(fn)
 
+    def forward(self, seq_len: int, dtype: torch.dtype):
+        key = (seq_len, dtype, self.inv_freq.device)
+        cached = self._cache.get(key)
+        if cached is not None:
+            return cached
 
-def _rope(seq_len: int, head_dim: int, theta: float, device: torch.device):
-    inv_freq = 1.0 / (
-        theta ** (torch.arange(0, head_dim, 2, device=device, dtype=torch.float32) / head_dim)
-    )
-    freqs = torch.outer(torch.arange(seq_len, device=device, dtype=torch.float32), inv_freq)
-    angles = torch.cat((freqs, freqs), dim=-1)
-    return angles.cos()[None, None], angles.sin()[None, None]
+        positions = torch.arange(
+            seq_len, device=self.inv_freq.device, dtype=self.inv_freq.dtype
+        )
+        freqs = torch.outer(positions, self.inv_freq)
+        angles = torch.cat((freqs, freqs), dim=-1)
+        result = (
+            angles.cos().to(dtype)[None, None],
+            angles.sin().to(dtype)[None, None],
+        )
+        self._cache[key] = result
+        return result
 
 
 def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
     half = x.shape[-1] // 2
     rotated = torch.cat((-x[..., half:], x[..., :half]), dim=-1)
-    return x * cos.to(x.dtype) + rotated * sin.to(x.dtype)
+    return x * cos + rotated * sin
+
+
+_CAUSAL_MASK_CACHE = {}
+
+
+def _causal_mask(seq_len: int, device: torch.device) -> torch.Tensor:
+    key = (seq_len, device)
+    mask = _CAUSAL_MASK_CACHE.get(key)
+    if mask is None:
+        mask = torch.triu(
+            torch.ones(seq_len, seq_len, device=device, dtype=torch.bool), diagonal=1
+        )
+        _CAUSAL_MASK_CACHE[key] = mask
+    return mask
+
+
+def _megatron_math_attention(
+    query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
+) -> torch.Tensor:
+    batch, num_heads, seq_len, head_dim = query.shape
+    query = query.reshape(batch * num_heads, seq_len, head_dim)
+    key = key.reshape(batch * num_heads, seq_len, head_dim)
+    value = value.reshape(batch * num_heads, seq_len, head_dim)
+
+    scores = torch.baddbmm(
+        torch.empty(
+            batch * num_heads,
+            seq_len,
+            seq_len,
+            device=query.device,
+            dtype=query.dtype,
+        ),
+        query,
+        key.transpose(1, 2),
+        beta=0.0,
+        alpha=1.0 / math.sqrt(head_dim),
+    )
+    scores = scores.view(batch, num_heads, seq_len, seq_len)
+    scores.masked_fill_(_causal_mask(seq_len, query.device), -10000.0)
+    probabilities = torch.softmax(scores, dim=-1)
+    context = torch.bmm(
+        probabilities.view(batch * num_heads, seq_len, seq_len), value
+    )
+    return context.view(batch, num_heads, seq_len, head_dim)
+
+
+class _CausalCrossEntropy(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, logits: torch.Tensor, targets: torch.Tensor):
+        original_dtype = logits.dtype
+        probabilities = logits.float()
+        if probabilities.data_ptr() == logits.data_ptr():
+            probabilities = probabilities.clone()
+
+        flat_probabilities = probabilities.view(-1, probabilities.shape[-1])
+        flat_targets = targets.reshape(-1)
+        max_logits = flat_probabilities.amax(dim=-1, keepdim=True)
+        flat_probabilities.sub_(max_logits)
+        target_logits = flat_probabilities.gather(
+            -1, flat_targets.unsqueeze(-1)
+        ).squeeze(-1)
+        flat_probabilities.exp_()
+        sum_exp = flat_probabilities.sum(dim=-1)
+        loss = (sum_exp.log() - target_logits).mean()
+        flat_probabilities.div_(sum_exp.unsqueeze(-1))
+
+        ctx.save_for_backward(probabilities, flat_targets)
+        ctx.original_dtype = original_dtype
+        return loss
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        probabilities, flat_targets = ctx.saved_tensors
+        grad_logits = probabilities.view(-1, probabilities.shape[-1])
+        rows = torch.arange(flat_targets.numel(), device=flat_targets.device)
+        grad_logits[rows, flat_targets] -= 1.0
+        grad_logits.mul_(grad_output / flat_targets.numel())
+        return probabilities.to(ctx.original_dtype), None
+
+
+def causal_cross_entropy(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    return _CausalCrossEntropy.apply(logits, targets)
 
 
 class Qwen3Attention(nn.Module):
@@ -75,9 +174,9 @@ class Qwen3Attention(nn.Module):
         k = k.repeat_interleave(self.num_kv_groups, dim=1)
         v = v.repeat_interleave(self.num_kv_groups, dim=1)
 
-        # The portable baseline uses the math SDPA path on both V100 and A100.
-        # The production baseline switches this to the fastest available SDPA kernel.
-        if self.attention_backend == "math":
+        if self.attention_backend == "megatron_math":
+            out = _megatron_math_attention(q, k, v)
+        elif self.attention_backend == "math":
             from torch.nn.attention import SDPBackend, sdpa_kernel
 
             with sdpa_kernel(SDPBackend.MATH):
@@ -128,6 +227,7 @@ class Qwen3ForCausalLM(nn.Module):
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList([Qwen3DecoderLayer(config) for _ in range(config.num_layers)])
         self.norm = Qwen3RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.rotary_emb = Qwen3RotaryEmbedding(config.head_dim, config.rope_theta)
         self.gradient_checkpointing = False
         self.apply(self._init_weights)
 
@@ -139,11 +239,15 @@ class Qwen3ForCausalLM(nn.Module):
     def enable_gradient_checkpointing(self):
         self.gradient_checkpointing = True
 
-    def forward(self, input_ids: torch.Tensor, labels: torch.Tensor = None):
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        labels: torch.Tensor = None,
+        return_logits: bool = True,
+        labels_shifted: bool = False,
+    ):
         x = self.embed_tokens(input_ids)
-        cos, sin = _rope(
-            input_ids.shape[1], self.config.head_dim, self.config.rope_theta, input_ids.device
-        )
+        cos, sin = self.rotary_emb(input_ids.shape[1], x.dtype)
         for layer in self.layers:
             if self.gradient_checkpointing and self.training:
                 x = torch.utils.checkpoint.checkpoint(layer, x, cos, sin, use_reentrant=False)
@@ -160,19 +264,26 @@ class Qwen3ForCausalLM(nn.Module):
                 self.embed_tokens.vocab_start,
                 self.embed_tokens.vocab_end,
                 self._tp_group,
+                labels_shifted=labels_shifted,
             )
-            return {"logits": logits, "loss": loss}
+            return {"logits": logits if return_logits else None, "loss": loss}
 
         # Qwen3 ties the LM head to the token embedding matrix.
-        logits = F.linear(x, self.embed_tokens.weight)
-
         loss = None
-        if labels is not None:
-            shift_logits = logits[:, :-1].contiguous().float()
-            shift_labels = labels[:, 1:].contiguous()
-            loss = F.cross_entropy(
-                shift_logits.view(-1, shift_logits.shape[-1]), shift_labels.view(-1)
-            )
+        if labels is not None and not return_logits:
+            loss_hidden = x if labels_shifted else x[:, :-1]
+            loss_targets = labels if labels_shifted else labels[:, 1:]
+            loss_logits = F.linear(loss_hidden, self.embed_tokens.weight)
+            loss = causal_cross_entropy(loss_logits, loss_targets)
+            logits = None
+        else:
+            logits = F.linear(x, self.embed_tokens.weight)
+            if labels is not None:
+                loss_logits = logits if labels_shifted else logits[:, :-1].contiguous()
+                loss_targets = labels if labels_shifted else labels[:, 1:].contiguous()
+                loss = causal_cross_entropy(
+                    loss_logits, loss_targets
+                )
         return {"logits": logits, "loss": loss}
 
     def parameter_count(self) -> int:

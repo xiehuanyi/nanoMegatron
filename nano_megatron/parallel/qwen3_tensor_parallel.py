@@ -43,11 +43,13 @@ def vocab_parallel_cross_entropy(
     vocab_start: int,
     vocab_end: int,
     tp_group,
+    labels_shifted: bool = False,
 ):
     # Hidden is replicated; its gradient is the sum of contributions from all vocab shards.
     hidden = _SplitFunc.apply(hidden, tp_group)
-    local_logits = F.linear(hidden[:, :-1], local_weight).float()
-    targets = labels[:, 1:]
+    loss_hidden = hidden if labels_shifted else hidden[:, :-1]
+    targets = labels if labels_shifted else labels[:, 1:]
+    local_logits = F.linear(loss_hidden, local_weight).float()
 
     local_max = local_logits.detach().amax(dim=-1)
     dist.all_reduce(local_max, op=dist.ReduceOp.MAX, group=tp_group)

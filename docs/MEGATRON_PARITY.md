@@ -21,12 +21,12 @@ attention backend 下，让 nanoMegatron 达到 Megatron Core 的训练吞吐和
 
 | ID | Megatron 特性 | nanoMegatron | 状态 | 性能/显存验收点 | 优先级 |
 |---|---|---|---|---|---|
-| M01 | Dense GPT/Qwen 模型 | 新增 Qwen3 dense benchmark model | PARTIAL | 参数量、层结构、loss 对齐 | P0 |
+| M01 | Dense GPT/Qwen 模型 | Qwen3-0.6B 参数量、结构和 1024 个 shifted labels 对齐 | PARTIAL | 固定输入的 loss/梯度逐层对齐 | P0 |
 | M02 | FP32/FP16/BF16 混合精度 | FP16 master weights；策略间不统一 | PARTIAL | loss scale、master grad/weight 布局对齐 | P0 |
 | M03 | Tensor Parallel | Column/Row parallel，Phi-MoE 路径 | PARTIAL | TP=2/4 吞吐、显存、通信次数 | P0 |
 | M04 | Sequence Parallel | 当前仅 stub/有限路径 | PARTIAL | TP+SP 激活显存和 numerics | P0 |
 | M05 | Data Parallel DDP | 手写 all-reduce | DONE | bucket size、overlap 后达到 DP 基线 | P0 |
-| M06 | Distributed Optimizer | dtype flat buffer + 等长 tensor shard + RS/AG | PARTIAL | D1 三次运行验收中 | P0 |
+| M06 | Distributed Optimizer | dtype flat buffer + 等长 tensor shard + RS/AG | PARTIAL | D4 三次运行验收 | P0 |
 | M07 | Pipeline Parallel | GPipe | PARTIAL | 1F1B、bubble、P2P overlap | P1 |
 | M08 | Interleaved/virtual PP | 无 | TODO | VPP schedule 与 bubble | P1 |
 | M09 | Context Parallel | 无 | TODO | 长序列 ring P2P/all-gather 路径 | P1 |
@@ -34,18 +34,18 @@ attention backend 下，让 nanoMegatron 达到 Megatron Core 的训练吞吐和
 | M11 | Expert Tensor Parallel | 无独立 ETP | TODO | EP/ETP folding 拓扑 | P2 |
 | M12 | TP 通信计算重叠 | 同步 collective | TODO | `tp-comm-overlap` 同级隐藏率 | P0 |
 | M13 | DP grad reduce overlap | post-accumulate hook 异步 ReduceScatter | PARTIAL | D1 backward/RS overlap | P0 |
-| M14 | DP param gather overlap | bucket 异步 AllGather，尚未跨 step overlap | PARTIAL | optimizer 后 AG/next forward overlap | P0 |
+| M14 | DP param gather overlap | 按 forward 顺序异步 AllGather，pre-hook 等待，支持跨 step | PARTIAL | 对齐 Megatron stream/event 调度 | P0 |
 | M15 | PP 通信重叠 | 无 | TODO | send/recv 与计算重叠 | P1 |
-| M16 | Contiguous param/grad buffers | 参数/梯度按 dtype 连续分桶，rank shard 等长 | PARTIAL | 分配次数、碎片、通信 bucket 对齐 | P0 |
+| M16 | Contiguous param/grad buffers | 参数/梯度连续分桶，40M 元素越界后封桶，rank shard 等长 | PARTIAL | D4 已对齐为 11 buckets，待显存验收 | P0 |
 | M17 | Activation recomputation | 整层 checkpoint | PARTIAL | full/selective 两档速度/显存曲线 | P0 |
 | M18 | Selective recomputation | 无 | TODO | core-attn selective recompute | P1 |
 | M19 | Activation CPU offload | 无 | TODO | 异步 D2H/H2D overlap | P2 |
-| M20 | Fused attention | PyTorch SDPA | PARTIAL | A100/H100 与 TE FlashAttention 对标 | P0 |
-| M21 | Fused RMSNorm | Python/PyTorch 实现 | TODO | TE/Apex 或 Triton kernel 对标 | P0 |
-| M22 | Fused QKV/MLP GEMM | Q/K/V 与 gate/up 分离 | TODO | GEMM 数量、kernel time、临时张量 | P0 |
-| M23 | Fused RoPE | Python/PyTorch 实现 | TODO | kernel 数量和 HBM traffic | P1 |
-| M24 | Fused cross entropy | 标准 PyTorch CE | TODO | vocab-parallel CE 吞吐/峰值 | P0 |
-| M25 | Fused optimizer | torch AdamW + Python copies | TODO | optimizer step time、state memory | P0 |
+| M20 | Attention backend | D4 对齐 local/unfused `baddbmm-softmax-bmm`；另有 SDPA | PARTIAL | A100/H100 再对标 TE/FlashAttention | P0 |
+| M21 | RMSNorm | D4 使用 `torch.nn.RMSNorm`，与当前 Megatron local path 一致 | DONE | D4 `48975002` | P0 |
+| M22 | Fused QKV/MLP GEMM | fused QKV 和 gate/up projection | DONE | D2 `48908022` | P0 |
+| M23 | Fused RoPE | D4 缓存 cos/sin，仍是 PyTorch pointwise graph | PARTIAL | kernel 数量和 HBM traffic | P1 |
+| M24 | Cross entropy | D4 custom autograd，FP32 in-place softmax，不保留返回 logits | PARTIAL | DP 已对齐，TP vocab-parallel backward 继续核对 | P0 |
+| M25 | Fused optimizer | fused torch AdamW，main-grad copy/scale 仍为独立 kernel | PARTIAL | optimizer step time、state memory | P0 |
 | M26 | FP8 / Transformer Engine | 无 | TODO | H100/A100 可用矩阵分别验收 | P2 |
 | M27 | CUDA Graph | 无 | TODO | steady-state launch overhead | P2 |
 | M28 | MoE router aux/z loss | 无 | TODO | loss 与梯度正确性 | P1 |
@@ -83,6 +83,7 @@ attention backend 下，让 nanoMegatron 达到 Megatron Core 的训练吞吐和
 | D1 (flat RS/AG) | DP2 + distributed optimizer | 4770.0 | 5812.2 | 0.821 | 1.328 | 速度提升明显，显存回退，仍未达标 |
 | D2* (fused projections/Adam) | DP2 + distributed optimizer | 4974.5 | 5813.2 | 0.856 | 1.272 | 单次探索，尚未正式验收 |
 | D3* (+ param AG overlap) | DP2 + distributed optimizer | 5020.1 | 5815.9 | 0.863 | 1.272 | 单次探索，尚未正式验收 |
+| D4 (compute graph parity) | DP2 + distributed optimizer | 运行中 | 运行中 | - | - | job `48975002` |
 | T0 | TP2 | 4860.1 | 4562.5 | 1.067 | 1.062 | 速度达标，显存未达标 |
 
 以上均为 3 次独立运行的中位数。D0 定位出的整 bucket AllReduce、完整 parameter
@@ -96,6 +97,19 @@ tok/s（+30.8%），但仍只有 Megatron 的 82.1%；峰值显存从 13130 MiB 
 D2/D3 进一步融合 QKV、SwiGLU gate/up 和 AdamW，并按 forward 顺序发起参数
 AllGather、由 module pre-hook 等待对应 bucket。单次吞吐分别达到 4974.5 和
 5020.1 tok/s；这是有方向性的改善，但按验收规则仍需三次独立运行才能替换 D1。
+
+D4 对齐此前最大的计算图差异：使用与 Megatron local/unfused 路径相同的 FP16
+`baddbmm -> causal mask -> softmax -> bmm` attention，切换到
+`torch.nn.RMSNorm`，缓存 RoPE，使用 custom in-place cross entropy，并在 benchmark
+中不返回完整 logits。同时按 Megatron 的 40M 元素规则在加入参数后封桶，使 bucket
+数从 13 降到 11。公平性方面，nano 现在也计算全部 1024 个 shifted labels，并在每步
+执行 distributed grad norm/finite check；这两项此前都让 nano 的数字略占便宜。
+
+D4 后仍未完全对齐的是 Megatron 的通信/多 tensor 执行细节：ReduceScatter 后除法、
+model-dtype 到 FP32 main-grad copy、overflow/norm 和 optimizer 调度尚未融合；
+AllGather 的依赖由 Python `Work.wait()` 驱动，而非完整的 stream/event 调度。D4
+结果出来后，下一轮优先用分阶段 CUDA timing 判断瓶颈在 attention backward、grad
+copy/norm、Adam 还是 param gather，避免继续凭感觉改动。
 
 ## 参考口径
 
