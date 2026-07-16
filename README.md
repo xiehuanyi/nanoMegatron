@@ -39,6 +39,47 @@ A working SFT pipeline on [Phi-tiny-MoE](https://huggingface.co/microsoft/Phi-ti
 | **Mixed precision policy** | manual fp32 master copies | – | ✓ | ✓ |
 | **FlashAttention** | via PyTorch SDPA | explicit dispatch | – | – |
 
+### nanoMegatron vs Megatron Core feature parity
+
+`DONE` means the current implementation has a tested parity path. `PARTIAL`
+means the basic algorithm exists but production semantics, composition, scale,
+or performance are not fully aligned. `TODO` means the feature is not
+implemented. The detailed acceptance criteria and experiment IDs are maintained
+in [`docs/MEGATRON_PARITY.md`](docs/MEGATRON_PARITY.md).
+
+| Area | Megatron Core feature | nanoMegatron status | Current evidence / remaining gap |
+|---|---|---|---|
+| Model | Dense GPT/Qwen decoder | PARTIAL | Qwen3-0.6B structure, shifted labels, fixed tokens, loss, and gradients are aligned for the DP2 benchmark |
+| Precision | FP32/FP16/BF16 mixed precision | PARTIAL | FP16 master weights work; precision policy is not yet uniform across every parallel strategy |
+| Data parallel | DDP with bucketed gradient reduction | DONE | Hand-written DDP and flat gradient buffers |
+| Distributed optimizer | Sharded optimizer states and main parameters | PARTIAL | DP2 throughput/HBM pass D6; implementation is not yet validated at larger DP sizes |
+| Grad overlap | Backward gradient ReduceScatter overlap | PARTIAL | Async post-accumulate hooks are implemented; stream scheduling is simpler than Megatron |
+| Param overlap | Next-forward parameter AllGather overlap | PARTIAL | Forward-order launch and module pre-hook waits work; dependencies still use Python `Work.wait()` |
+| Tensor parallel | Column/row parallel linear layers | PARTIAL | TP paths exist, but TP+SP composition and communication overlap are incomplete |
+| Sequence parallel | Sequence-dimension activation sharding | PARTIAL | Stub/limited paths only |
+| Pipeline parallel | GPipe and 1F1B schedules | PARTIAL | GPipe exists; 1F1B, interleaving, and communication overlap are missing |
+| Virtual pipeline | Interleaved pipeline stages | TODO | No virtual pipeline schedule |
+| Context parallel | Long-sequence context sharding | TODO | No context-parallel attention path |
+| Expert parallel | MoE AllToAll dispatch | PARTIAL | Dispatch works; production token permutation and grouped GEMM are not aligned |
+| Expert tensor parallel | Independent ETP dimension | TODO | No ETP topology |
+| Recomputation | Full and selective activation recompute | PARTIAL | Whole-layer checkpointing exists; selective core-attention recompute is missing |
+| Attention | Local/unfused, SDPA, Flash/TE backends | PARTIAL | D6 uses aligned local/unfused math; no Megatron TE/Flash backend parity yet |
+| Core kernels | Fused QKV and SwiGLU projections | DONE | QKV and gate/up GEMMs are coalesced |
+| Norm/RoPE | Fused RMSNorm and RoPE | PARTIAL | RMSNorm semantics align; RoPE is cached but remains a PyTorch pointwise graph |
+| Cross entropy | Vocab-parallel fused cross entropy | PARTIAL | DP custom in-place CE is aligned; TP vocab-parallel backward still needs validation |
+| Optimizer | Fused Adam and multi-tensor utilities | PARTIAL | nano uses fused torch AdamW; Megatron uses TE FusedAdam in D6; nano main-grad copy/check remains separate |
+| Transformer Engine | TE layers and FP8 recipes | TODO | TE 2.9 is installed only for the Megatron reference optimizer; nano has no TE TransformerLayer or FP8 path |
+| CUDA Graphs | Captured steady-state execution | TODO | No graph capture |
+| MoE training | Router aux/z loss and capacity policies | TODO | Router balancing and token-drop policies are not implemented |
+| Grouped GEMM | Batched expert GEMMs | TODO | Experts still execute through Python/module loops |
+| Checkpointing | Distributed and async checkpoints | PARTIAL | Basic rank-0 save exists; sharded resharding and async save are missing |
+| Distributed RNG | TP/PP-aware RNG trackers | PARTIAL | Basic deterministic seeds exist; no full model-parallel RNG tracker |
+| Training loop | Gradient accumulation | DONE | Accumulation and communication suppression are supported |
+| Reliability | Global grad norm, overflow, and clipping | PARTIAL | Main paths work, but behavior is not uniform across every strategy |
+| Data pipeline | Packed sequences and indexed datasets | TODO | Uses ordinary dataset/DataLoader paths |
+| Observability | Timers, MFU, memory, communication traces | PARTIAL | JSON throughput, HBM, software manifest, correctness, and profiler traces exist; MFU/NCCL telemetry is incomplete |
+| Resilience | Fault tolerance and straggler detection | TODO | Not implemented |
+
 **The trade-off**: the core algorithms and the first layer of production optimizations are here, but fused kernels, selective recomputation, communication scheduling, and allocator integration are still much simpler than Megatron Core. The benchmark below tracks that remaining gap rather than calling an implementation "done" merely because it runs.
 
 **When to use what**:
@@ -55,7 +96,7 @@ A working SFT pipeline on [Phi-tiny-MoE](https://huggingface.co/microsoft/Phi-ti
 
 ### Qwen3-0.6B vs Megatron Core: optimization log
 
-This is the current parity target: 2× V100 PCIe, FP16, sequence length 1024,
+This is the current parity target: 2× V100-SXM2 with NVLink, FP16, sequence length 1024,
 micro/global batch 1/2, no recomputation, portable/unfused attention, and a real
 Adam update every step. Megatron Core is pinned to `v0.15.3`. Formal acceptance
 requires the median of three independent jobs to reach at least 95% throughput

@@ -45,8 +45,8 @@ attention backend 下，让 nanoMegatron 达到 Megatron Core 的训练吞吐和
 | M22 | Fused QKV/MLP GEMM | fused QKV 和 gate/up projection | DONE | D2 `48908022` | P0 |
 | M23 | Fused RoPE | D4 缓存 cos/sin，仍是 PyTorch pointwise graph | PARTIAL | kernel 数量和 HBM traffic | P1 |
 | M24 | Cross entropy | D4 custom autograd，FP32 in-place softmax，不保留返回 logits | PARTIAL | DP 已对齐，TP vocab-parallel backward 继续核对 | P0 |
-| M25 | Fused optimizer | nano 使用 fused torch AdamW；Megatron D6 使用 TE FusedAdam | PARTIAL | optimizer step time、state memory | P0 |
-| M26 | FP8 / Transformer Engine | 无 | TODO | H100/A100 可用矩阵分别验收 | P2 |
+| M25 | Fused optimizer | nano 使用 fused torch AdamW；Megatron D6 使用 TE FusedAdam，独立 20-step numerics 已核对 | PARTIAL | main-grad copy/check 融合、optimizer state memory | P0 |
+| M26 | FP8 / Transformer Engine | benchmark 环境只为 Megatron reference 安装 TE optimizer；nano 无 TE layer/FP8 | TODO | H100/A100 可用矩阵分别验收 | P2 |
 | M27 | CUDA Graph | 无 | TODO | steady-state launch overhead | P2 |
 | M28 | MoE router aux/z loss | 无 | TODO | loss 与梯度正确性 | P1 |
 | M29 | MoE capacity/drop policies | 无 | TODO | dispatch correctness 与负载 | P1 |
@@ -57,7 +57,7 @@ attention backend 下，让 nanoMegatron 达到 Megatron Core 的训练吞吐和
 | M34 | Gradient accumulation | 支持 | DONE | no_sync/通信频率对齐 | P0 |
 | M35 | Gradient clipping/NaN detection | 部分策略支持 | PARTIAL | distributed norm 与 overflow 行为 | P1 |
 | M36 | 数据预处理/packed sequence | 普通 HF DataLoader | TODO | padding 浪费、loader 吞吐 | P1 |
-| M37 | MFU/通信/内存可观测性 | tok/s + peak allocated | PARTIAL | JSON、MFU、per-rank memory、NCCL trace | P0 |
+| M37 | MFU/通信/内存可观测性 | JSON tok/s、allocated/SMI、软件清单、正确性和 profiler trace | PARTIAL | MFU、per-rank memory、NCCL trace | P0 |
 | M38 | Fault tolerance/straggler detection | 无 | TODO | 大规模训练前再纳入 | P2 |
 
 ## 推进顺序
