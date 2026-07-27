@@ -1,0 +1,113 @@
+{
+  "schema_version": 1,
+  "protocol": "B0-portable-single-gpu",
+  "run_count": 3,
+  "source_summaries": [
+    "benchmark_logs/qwen3_0.6b/48892019/summary.json",
+    "benchmark_logs/qwen3_0.6b/48892133/summary.json",
+    "benchmark_logs/qwen3_0.6b/48892134/summary.json"
+  ],
+  "median": {
+    "nano_tokens_per_second": 3364.6546845834887,
+    "megatron_tokens_per_second": 3559.2631213069167,
+    "throughput_ratio_nano_over_megatron": 0.9453233913619821,
+    "nano_peak_smi_mib": 16110.0,
+    "megatron_peak_smi_mib": 16610.0,
+    "memory_ratio_nano_over_megatron": 0.9698976520168573
+  },
+  "runs": [
+    {
+      "schema_version": 1,
+      "protocol": "B0-portable-single-gpu",
+      "nano": {
+        "tokens_per_second": 3363.946049981345,
+        "mean_step_ms": 304.40440624952316,
+        "peak_smi_mib": 16110.0,
+        "peak_allocated_gib": 14.230970859527588
+      },
+      "megatron": {
+        "tokens_per_second": 3573.0486060225408,
+        "mean_step_ms": 286.59000000000003,
+        "peak_smi_mib": 16610.0
+      },
+      "parity": {
+        "throughput_ratio_nano_over_megatron": 0.9414778305314001,
+        "memory_ratio_nano_over_megatron": 0.9698976520168573
+      },
+      "megatron_measured_step_ms": [
+        288.1,
+        286.0,
+        286.0,
+        287.1,
+        286.9,
+        285.6,
+        285.6,
+        287.9,
+        286.8,
+        285.9
+      ]
+    },
+    {
+      "schema_version": 1,
+      "protocol": "B0-portable-single-gpu",
+      "nano": {
+        "tokens_per_second": 3364.6546845834887,
+        "mean_step_ms": 304.340295214206,
+        "peak_smi_mib": 16110.0,
+        "peak_allocated_gib": 14.230970859527588
+      },
+      "megatron": {
+        "tokens_per_second": 3559.2631213069167,
+        "mean_step_ms": 287.7,
+        "peak_smi_mib": 16610.0
+      },
+      "parity": {
+        "throughput_ratio_nano_over_megatron": 0.9453233913619821,
+        "memory_ratio_nano_over_megatron": 0.9698976520168573
+      },
+      "megatron_measured_step_ms": [
+        287.5,
+        287.6,
+        288.0,
+        286.9,
+        288.2,
+        288.8,
+        287.6,
+        288.9,
+        286.1,
+        287.4
+      ]
+    },
+    {
+      "schema_version": 1,
+      "protocol": "B0-portable-single-gpu",
+      "nano": {
+        "tokens_per_second": 3366.983955709632,
+        "mean_step_ms": 304.12975335493684,
+        "peak_smi_mib": 16110.0,
+        "peak_allocated_gib": 14.230970859527588
+      },
+      "megatron": {
+        "tokens_per_second": 3549.6394897393234,
+        "mean_step_ms": 288.48,
+        "peak_smi_mib": 16610.0
+      },
+      "parity": {
+        "throughput_ratio_nano_over_megatron": 0.9485425112725729,
+        "memory_ratio_nano_over_megatron": 0.9698976520168573
+      },
+      "megatron_measured_step_ms": [
+        288.9,
+        288.5,
+        288.0,
+        288.5,
+        288.4,
+        289.4,
+        288.5,
+        288.7,
+        287.5,
+        288.4
+      ]
+    }
+  ]
+}

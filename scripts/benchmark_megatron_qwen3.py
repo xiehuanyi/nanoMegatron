@@ -1,0 +1,112 @@
+#!/usr/bin/env python3
+"""Megatron pretrain entry point with a rank-local fixed benchmark batch."""
+
+import os
+from functools import partial
+
+import torch
+
+from megatron.core import parallel_state
+from megatron.core.enums import ModelType
+import megatron.core.optimizer as mcore_optimizer
+from megatron.core.optimizer import distrib_optimizer as mcore_distrib_optimizer
+from megatron.core.optimizer import optimizer as mcore_optimizer_impl
+from megatron.training import get_args, inprocess_restart, pretrain
+from megatron.training.utils import get_batch_on_this_cp_rank
+
+import pretrain_gpt
+from gpt_builders import gpt_builder
+from model_provider import model_provider
+
+
+_CACHED_BATCHES = {}
+_ORIGINAL_GET_BATCH = pretrain_gpt.get_batch
+
+
+def _print_optimizer_backend():
+    if os.environ.get("RANK", "0") != "0":
+        return
+    if mcore_distrib_optimizer.USING_TE_OPTIMIZER:
+        distributed_backend = "transformer_engine"
+    elif mcore_distrib_optimizer.USING_APEX_OPTIMIZER:
+        distributed_backend = "apex"
+    else:
+        distributed_backend = "torch"
+    print(
+        "MCORE_OPTIMIZER_BACKEND "
+        f"adam={mcore_optimizer.Adam.__module__}.{mcore_optimizer.Adam.__name__} "
+        f"distributed={distributed_backend} "
+        f"multi_tensor={mcore_optimizer_impl.multi_tensor_scale_impl.__module__}",
+        flush=True,
+    )
+
+
+def _get_fixed_batch(data_iterator, vp_stage=None):
+    key = -1 if vp_stage is None else vp_stage
+    if key not in _CACHED_BATCHES:
+        original = tuple(_ORIGINAL_GET_BATCH(data_iterator, vp_stage))
+        if original[0] is None:
+            _CACHED_BATCHES[key] = original
+        else:
+            args = get_args()
+            device = original[0].device
+            # CP ranks must start from the same global sequence before
+            # Megatron applies its zigzag context slice.
+            input_rank = (
+                parallel_state.get_data_parallel_rank()
+                if args.context_parallel_size > 1
+                else torch.distributed.get_rank()
+            )
+            generator = torch.Generator(device=device).manual_seed(
+                args.seed + input_rank
+            )
+            token_stream = torch.randint(
+                0,
+                args.padded_vocab_size,
+                (args.micro_batch_size, args.seq_length + 1),
+                device=device,
+                generator=generator,
+            )
+            tokens = token_stream[:, :-1].contiguous()
+            labels = token_stream[:, 1:].contiguous()
+            loss_mask = torch.ones_like(labels, dtype=torch.float32)
+            position_ids = torch.arange(args.seq_length, device=device).expand_as(tokens)
+            if torch.distributed.get_rank() == 0:
+                print(
+                    "FIXED_BATCH "
+                    f"sum={token_stream.sum().item()} "
+                    f"prefix={token_stream[0, :8].tolist()}",
+                    flush=True,
+                )
+            batch = {
+                "tokens": tokens,
+                "labels": labels,
+                "loss_mask": loss_mask,
+                "attention_mask": None,
+                "position_ids": position_ids,
+            }
+            batch = get_batch_on_this_cp_rank(batch)
+            _CACHED_BATCHES[key] = tuple(batch.values())
+    return _CACHED_BATCHES[key]
+
+
+def main():
+    _print_optimizer_backend()
+    pretrain_gpt.get_batch = _get_fixed_batch
+    pretrain_gpt.train_valid_test_datasets_provider.is_distributed = True
+    wrapped_pretrain, store = inprocess_restart.maybe_wrap_for_inprocess_restart(pretrain)
+    wrapped_pretrain(
+        pretrain_gpt.train_valid_test_datasets_provider,
+        partial(model_provider, gpt_builder),
+        ModelType.encoder_or_decoder,
+        pretrain_gpt.forward_step,
+        args_defaults={"tokenizer_type": "GPT2BPETokenizer"},
+        extra_args_provider=(
+            pretrain_gpt.add_modelopt_args if pretrain_gpt.has_nvidia_modelopt else None
+        ),
+        store=store,
+    )
+
+
+if __name__ == "__main__":
+    main()

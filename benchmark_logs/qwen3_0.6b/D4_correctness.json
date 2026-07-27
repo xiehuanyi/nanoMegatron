@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "comparison": "nanoMegatron vs Megatron Core local implementation",
+  "model": {
+    "layers": 2,
+    "hidden_size": 64,
+    "attention_heads": 4,
+    "query_groups": 2,
+    "head_dim": 16,
+    "ffn_hidden_size": 128,
+    "vocab_size": 256,
+    "sequence_length": 16,
+    "micro_batch_size": 2
+  },
+  "method": "Identical weights and shifted token/label tensors; QKV weights reordered for Megatron grouped-query layout; compare full logits, mean loss, and every parameter gradient.",
+  "float32": {
+    "job_id": "48980002",
+    "loss_abs_diff": 0.0,
+    "logits_max_abs": 0.0,
+    "gradient_max_abs": 3.725290298461914e-08,
+    "gradient_min_cosine": 0.9999998807907104
+  },
+  "float16": {
+    "job_id": "48980005",
+    "loss_abs_diff": 6.4849853515625e-05,
+    "logits_max_abs": 0.0009765625,
+    "gradient_max_abs": 0.000244140625,
+    "gradient_min_cosine": 0.9999990463256836
+  }
+}

@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "protocol": "D5-dp2-identical-fixed-input-profile",
+  "formal_job": 48980514,
+  "profile_job": 48980515,
+  "formal": {
+    "nano_mean_step_ms": 242.72314310073853,
+    "megatron_mean_step_ms": 265.88,
+    "nano_tokens_per_second": 8437.596736088775,
+    "megatron_tokens_per_second": 7702.723032947194,
+    "throughput_ratio_nano_over_megatron": 1.095404404390275,
+    "memory_ratio_nano_over_megatron": 1.0166695606876195
+  },
+  "megatron_internal_timers_ms": {
+    "forward_compute_max": 99.43,
+    "backward_compute_max": 153.35,
+    "batch_generator_max": 0.03,
+    "optimizer_copy_to_main_grad_max": 3.71,
+    "optimizer_unscale_and_check_inf_max": 4.49,
+    "optimizer_inner_step_max": 28.68,
+    "optimizer_copy_main_to_model_params_max": 3.01,
+    "optimizer_total_max": 44.46
+  },
+  "three_profiled_steps": {
+    "nano_cuda_kernel_time_ms": 808.164,
+    "megatron_cuda_kernel_time_ms": 897.969,
+    "extra_megatron_kernel_time_per_step_ms": 29.935,
+    "nano_cuda_launch_count": 15180,
+    "megatron_cuda_launch_count": 17469,
+    "extra_megatron_cuda_launches_per_step": 763,
+    "nano_cuda_launch_cpu_time_ms": 84.784,
+    "megatron_cuda_launch_cpu_time_ms": 109.443
+  },
+  "nano_cpu_ranges_ms_per_step": {
+    "forward": 56.788836,
+    "backward": 138.17272733333333,
+    "grad_sync_copy_norm": 18.327328333333332,
+    "optimizer_launch_and_param_gather_launch": 1.400993
+  },
+  "diagnosis": [
+    "The large GEMM kernels have nearly identical runtime; the gap is not less model compute.",
+    "Megatron uses its fallback multi-tensor Adam path because Apex/Transformer Engine optimizer extensions are unavailable, while nanoMegatron uses torch fused AdamW. This accounts for roughly 17 ms/step.",
+    "Megatron launches about 763 more CUDA kernels per profiled step from generic TP-capable linear wrappers, main-grad scaling/checks, norm/cat/copy pointwise work, and repeated RoPE cos/sin application.",
+    "The remaining difference is Python/autograd/launch overhead: Megatron spent 24.7 ms more CPU time in cudaLaunchKernel across three profiled steps."
+  ]
+}

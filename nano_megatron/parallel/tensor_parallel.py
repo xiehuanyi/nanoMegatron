@@ -137,10 +137,14 @@ class RowParallelLinear(nn.Module):
 
     def forward(self, x):
         # x 已经是切分过的（来自上游 ColumnParallel 的输出）
-        y = self.linear(x)
+        # 注意：bias 不参与本地 matmul——否则 AllReduce SUM 会把 bias 加 tp_size 次。
+        # 正确做法：先 AllReduce partial 结果，再加一次完整 bias。
+        y = F.linear(x, self.linear.weight)
         # AllReduce 聚合各 GPU 的部分结果（除非上层会统一做）
         if not self.skip_reduce:
             y = _AllReduceFunc.apply(y, self.tp_group)
+        if self.linear.bias is not None:
+            y = y + self.linear.bias
         return y
 
     def load_weight_shard(self, full_weight, full_bias=None):
@@ -168,11 +172,25 @@ def tp_parallelize_attention(attn, tp_group):
     省 2 次 NCCL/层 backward。
     """
     # 保存原始权重（在原来的 device 上）
-    device = attn.q_proj.weight.device
-    q_w, q_b = attn.q_proj.weight.data, attn.q_proj.bias.data
-    k_w, k_b = attn.k_proj.weight.data, attn.k_proj.bias.data
-    v_w, v_b = attn.v_proj.weight.data, attn.v_proj.bias.data
-    o_w, o_b = attn.o_proj.weight.data, attn.o_proj.bias.data
+    if hasattr(attn, "qkv_proj"):
+        device = attn.qkv_proj.weight.device
+        q_out = attn.num_heads * attn.head_dim
+        kv_out = attn.num_kv_heads * attn.head_dim
+        q_w, k_w, v_w = attn.qkv_proj.weight.data.split(
+            (q_out, kv_out, kv_out), dim=0
+        )
+        q_b = k_b = v_b = None
+        del attn.qkv_proj
+    else:
+        device = attn.q_proj.weight.device
+        q_w = attn.q_proj.weight.data
+        k_w = attn.k_proj.weight.data
+        v_w = attn.v_proj.weight.data
+        q_b = attn.q_proj.bias.data if attn.q_proj.bias is not None else None
+        k_b = attn.k_proj.bias.data if attn.k_proj.bias is not None else None
+        v_b = attn.v_proj.bias.data if attn.v_proj.bias is not None else None
+    o_w = attn.o_proj.weight.data
+    o_b = attn.o_proj.bias.data if attn.o_proj.bias is not None else None
 
     in_dim = q_w.shape[1]
     q_out = q_w.shape[0]
@@ -181,10 +199,10 @@ def tp_parallelize_attention(attn, tp_group):
     o_out = o_w.shape[0]
 
     # 替换为并行版本（在同一 device 上创建）
-    attn.q_proj = ColumnParallelLinear(in_dim, q_out, bias=True, tp_group=tp_group, device=device)
-    attn.k_proj = ColumnParallelLinear(in_dim, k_out, bias=True, tp_group=tp_group, device=device)
-    attn.v_proj = ColumnParallelLinear(in_dim, v_out, bias=True, tp_group=tp_group, device=device)
-    attn.o_proj = RowParallelLinear(q_out, o_out, bias=True, tp_group=tp_group, device=device)
+    attn.q_proj = ColumnParallelLinear(in_dim, q_out, bias=q_b is not None, tp_group=tp_group, device=device)
+    attn.k_proj = ColumnParallelLinear(in_dim, k_out, bias=k_b is not None, tp_group=tp_group, device=device)
+    attn.v_proj = ColumnParallelLinear(in_dim, v_out, bias=v_b is not None, tp_group=tp_group, device=device)
+    attn.o_proj = RowParallelLinear(q_out, o_out, bias=o_b is not None, tp_group=tp_group, device=device)
 
     # 加载对应分片的权重
     attn.q_proj.load_weight_shard(q_w, q_b)

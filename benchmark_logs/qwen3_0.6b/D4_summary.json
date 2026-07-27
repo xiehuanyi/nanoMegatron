@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "protocol": "D4-dp2-compute-graph-parity",
+  "jobs": [
+    48977678,
+    48979015,
+    48979016
+  ],
+  "topology": "2x Tesla V100-SXM2-32GB with NVLink",
+  "nano": {
+    "median_tokens_per_second": 8435.235431950865,
+    "median_mean_step_ms": 242.79108941555023,
+    "median_peak_smi_mib": 11710.0,
+    "median_peak_allocated_gib": 10.733039855957031
+  },
+  "megatron": {
+    "median_tokens_per_second": 7610.836523096362,
+    "median_mean_step_ms": 269.09,
+    "median_peak_smi_mib": 11518.0
+  },
+  "parity": {
+    "throughput_ratio_nano_over_megatron": 1.1083190929607707,
+    "memory_ratio_nano_over_megatron": 1.0166695606876195,
+    "throughput_target_met": true,
+    "memory_target_met": true
+  }
+}
